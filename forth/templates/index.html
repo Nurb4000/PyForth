@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PyForth</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div id="app">
+    <div id="screen" aria-live="polite">
+      <div class="banner">PyForth &mdash; a FORTH interpreter</div>
+      <div class="hint">Type FORTH code and press Enter to run. Shift+Enter for a new line.</div>
+      <div id="log"></div>
+      <div id="promptline">
+        <span id="prompt" class="prompt">ok&gt; </span>
+        <textarea
+          id="input"
+          class="input"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          wrap="soft"
+          placeholder="1 2 + ."
+        ></textarea>
+      </div>
+    </div>
+    <div id="toolbar">
+      <button id="clear-btn" title="Clear the screen">clear</button>
+      <button id="reset-btn" title="Reset the interpreter">reset</button>
+      <span class="spacer"></span>
+      <span id="status" class="status"></span>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

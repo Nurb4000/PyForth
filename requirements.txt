@@ -1,0 +1,4 @@
+# Runtime dependencies.
+# The interpreter core and command-line front-end have no third-party
+# dependencies; Flask is only required for the web front-end (forth/web.py).
+Flask>=2.0
