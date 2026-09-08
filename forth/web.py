@@ -1,7 +1,7 @@
 """Web front-end for PyForth.
 
 Runs a small Flask application that exposes the interpreter over HTTP so it
-can be driven from a browser.  Two endpoints are provided:
+can be driven from a browser.  The routes are:
 
 ``GET  /``
     Serves the terminal-style UI.
@@ -10,6 +10,8 @@ can be driven from a browser.  Two endpoints are provided:
     ``{"output": "...", "error": null|message}``.
 ``POST /api/reset``
     Discards the current interpreter for the session.
+``GET  /api/health``
+    Liveness check.
 
 Each browser session gets its own :class:`forth.machine.Forth` instance, kept
 in a server-side dictionary keyed by a per-user session token.
@@ -23,6 +25,7 @@ Run with::
 
 import argparse
 import os
+import secrets
 import uuid
 
 from flask import (
@@ -31,7 +34,6 @@ from flask import (
     render_template,
     request,
     session,
-    url_for,
 )
 
 from .machine import Forth, ForthError
@@ -39,17 +41,20 @@ from .machine import Forth, ForthError
 
 def _new_app():
     app = Flask(__name__)
-    app.secret_key = os.environ.get("PYFORTH_SECRET_KEY", "pyforth-web-secret")
+    app.secret_key = os.environ.get("PYFORTH_SECRET_KEY") or secrets.token_hex(32)
     app.config["forth_instances"] = {}
     app.config["template_folder"] = "templates"
     app.config["static_folder"] = "static"
 
     def forth_for_session():
         token = session.get("token")
+        instances = app.config["forth_instances"]
         if token is None:
             token = uuid.uuid4().hex
             session["token"] = token
-        instances = app.config["forth_instances"]
+        if len(instances) > 1000:
+            # Bound memory: drop the oldest session's interpreter.
+            instances.pop(next(iter(instances)))
         if token not in instances:
             instances[token] = Forth()
         return instances[token]
@@ -67,8 +72,7 @@ def _new_app():
         # Expose the incoming text to KEY / EXPECT as well.
         forth.feed_input(code + "\n")
         try:
-            for line in code.splitlines():
-                forth.interpret(line)
+            forth.run(code)
         except (ForthError, RuntimeError) as error:
             forth.abort()
             text = forth.output_text()

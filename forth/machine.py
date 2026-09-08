@@ -133,7 +133,7 @@ class Tok:
     __slots__ = ("kind", "value")
 
     def __init__(self, kind, value):
-        self.kind = kind        # 'word' | 'num' | 'str' | 'paren'
+        self.kind = kind        # 'word'|'num'|'str'|'dotstr'|'abortstr'|'paren'|'parenstr'
         self.value = value
 
     def __repr__(self):
@@ -146,9 +146,10 @@ _BASE_CHARS = list(string.digits + string.ascii_uppercase)
 class Tokenizer:
     """Turn a line of FORTH source into tokens.
 
-    Understands balanced ``(...)`` comments, ``"..."`` string literals and
-    numeric literals in the current base (including ``16#`` / ``2#`` prefixes,
-    ``0x`` suffixes and ``_`` digit separators).
+    Understands balanced ``(...)`` comments, ``.( ``...``)`` immediate strings,
+    ``"..."`` / ``S"..."`` / ``." ..."`` string literals and numeric literals in
+    the current base (including ``16#`` / ``2#`` prefixes, ``0x`` suffixes and
+    ``_`` digit separators).
     """
 
     def __init__(self, machine):
@@ -180,6 +181,26 @@ class Tokenizer:
                 i += 2  # skip opening S"
                 content, i = self._read_string(line, i, n)
                 toks.append(Tok("str", content))
+                continue
+            if c == "." and i + 1 < n and line[i + 1] == '"':
+                i += 2  # skip opening ."  (immediate string, printed at runtime)
+                content, i = self._read_string(line, i, n)
+                toks.append(Tok("dotstr", content))
+                continue
+            if c == "." and i + 1 < n and line[i + 1] == "(":
+                # .( text) prints its text immediately.
+                close = line.find(")", i + 2)
+                if close == -1:
+                    close = n
+                content = line[i + 2:close]
+                toks.append(Tok("parenstr", content))
+                i = close + 1
+                continue
+            if line[i:i + 5].upper() == "ABORT" and i + 5 < n \
+                    and line[i + 5] == '"':
+                i += 6  # skip ABORT"
+                content, i = self._read_string(line, i, n)
+                toks.append(Tok("abortstr", content))
                 continue
             if c == '"':
                 i += 1  # skip opening quote
@@ -326,7 +347,11 @@ class Forth:
         self._pending_does = None # word being finished by a DOES> 
         self.compile_state = _CompileState()
         self.output = []          # captured output buffer
-        self.ip = 0               # instruction pointer during body execution
+        # stack-pointer pseudo-addresses (set/read by SP! / SP@ / RS@)
+        self.sp_addr = 0
+        self.rs_addr = 0
+        # execution tokens (xt) for EXECUTE / [']  -- id(entry) -> entry
+        self.exec_map = {}
         # input buffering for KEY / EXPECT
         self.input_buffer = ""
         self.input_index = 0
@@ -521,6 +546,30 @@ class Forth:
             if k == "str":
                 cs.numbuf.append(self._make_static_string(t.value))
                 continue
+            if k == "dotstr":
+                # ." text" compiles/executes as: push the string, print it.
+                dest = self.current.body if self.compiling else temp
+                self._flush(dest)
+                dest.append(["lit", self._make_static_string(t.value)])
+                dest.append(["prim", "S."])
+                continue
+            if k == "parenstr":
+                # .( text) behaves like ." here: the text is compiled/executed
+                # as "push the string, print it", so it stays in line with the
+                # surrounding words (e.g. ``CR .( hi)`` prints hi after the CR).
+                dest = self.current.body if self.compiling else temp
+                self._flush(dest)
+                dest.append(["lit", self._make_static_string(t.value)])
+                dest.append(["prim", "S."])
+                continue
+            if k == "abortstr":
+                # ABORT" text" compiles/executes as: push the string, abort.
+                dest = self.current.body if self.compiling else temp
+                self._flush(dest)
+                dest.append(["lit", self._make_static_string(t.value)])
+                dest.append(["prim", "STR@"])
+                dest.append(["prim", "ABORT"])
+                continue
 
             name = t.value.upper()
 
@@ -549,7 +598,7 @@ class Forth:
                 # needs lookahead, so handle it here rather than at runtime.
                 dest = self.current.body if self.compiling else temp
                 if i < n and toks[i].kind in ("word", "num", "str"):
-                    value = toks[i].value or ""
+                    value = str(toks[i].value or "")
                     ch = value[0] if value else " "
                     i += 1
                 else:
@@ -583,11 +632,23 @@ class Forth:
                     cs.advance_by = 0
                 continue
 
+            # Immediate words run their compile action while compiling a
+            # definition, which lets them consume the following tokens
+            # (LITERAL takes its value, POSTPONE / ['] take a word name, ...).
+            if self.compiling and entry.immediate and p is not None \
+                    and p.compile is not None:
+                p.compile(self, toks, i)
+                if cs.advance_by:
+                    i = cs.advance_by
+                    cs.advance_by = 0
+                continue
+
             # Normal word: flush buffered numbers, then emit a cell into the
             # appropriate destination (current definition or temp list).
             if name == "+LOOP" and cs.numbuf:
                 # A number immediately preceding +LOOP is its constant step.
                 step = cs.numbuf.pop()
+                dest = self.current.body if self.compiling else temp
                 dest.append(["ploop", to_cell(step)])
                 continue
             dest = self.current.body if self.compiling else temp
@@ -743,12 +804,3 @@ class Forth:
         if len(self.loops) <= n:
             raise ForthError("J without enough DOs")
         return self.loops[-1 - n]
-
-
-_DONE = object()
-
-# Words that consume buffered numbers / tokens from the compilation stream.
-_OPERAND_WORDS = {
-    "CONSTANT", "LITERAL", "+LOOP", "ALIAS", "POSTPONE",
-    "VARIABLE", "CREATE", "DOES>", "ALLOT", "IMMEDIATE",
-}

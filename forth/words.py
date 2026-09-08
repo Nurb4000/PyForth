@@ -1,14 +1,13 @@
 """Catalogue of FORTH primary (built-in) words for PyForth.
 
 This module registers a fairly complete ANSI-FORTH core together with a set
-of extensions (strings, arrays, files, extended math and I/O).  It is installed
+of extensions (strings, arrays, extended math and I/O).  It is installed
 by :func:`register_words` onto a :class:`forth.machine.Forth` instance.
 """
 
 from __future__ import annotations
 
 import math
-import os
 
 from .machine import Primary, to_cell, CELL_MASK
 
@@ -163,10 +162,10 @@ def register_words(f):
     add("F-", P(_fsub))
     add("F*", P(_fmul))
     add("F/", P(_fdiv))
-    # FM/ and UM/M (signed/unsigned divide)
-    add("FM/", P(_fmdiscard))
+    # FM/ and UM/M (signed/unsigned divide) -- leave quotient and remainder.
+    add("FM/", P(_fmdiv))
     add("FM/DP", P(_fmdiv))
-    add("UM/M", P(_umdiscard))
+    add("UM/M", P(_umdp))
     add("UM/DP", P(_umdp))
     add("/+", P(_plusdiv))
     add("-/", P(_minusdiv))
@@ -296,7 +295,7 @@ def register_words(f):
     add("[", P(_bracket, compile=_compile_bracket), immediate=True)
     add("]", P(_square, compile=_compile_square), immediate=True)
     add("[']", P(_lit_tick, compile=_compile_lit_tick), immediate=True)
-    add("[COMPILE]", P(_compile_compile), immediate=True)
+    add("[COMPILE]", P(_noop_execute, compile=_compile_compile), immediate=True)
     add("LITERAL", P(_literal, compile=_compile_literal), immediate=True)
     add("POSTPONE", P(_postpone, compile=_compile_postpone), immediate=True)
     add("IMMEDIATE", P(_immediate), immediate=True)
@@ -339,11 +338,11 @@ def register_words(f):
     add("I", P(_i))
     add("J", P(_j))
     add("K", P(_k))
-    add("UNDO", P(execute=_noop_execute, is_control=True))
+    add("UNDO", P(execute=_noop_control, is_control=True))
     add("LEAVE", P(execute=_exec_leave, is_control=True))
     add("CASE", P(execute=_exec_case, is_control=True))
     add("OF", P(execute=_exec_of, is_control=True))
-    add("ENDOF", P(execute=_noop_execute, is_control=True))
+    add("ENDOF", P(execute=_noop_control, is_control=True))
     add("ENDCASE", P(execute=_exec_endcase, is_control=True))
     add("SELECTCASE", P(execute=_exec_case, is_control=True))
 
@@ -365,8 +364,8 @@ def _rot(f):
     f.ds.push(b); f.ds.push(c); f.ds.push(a)
 
 def _nrot(f):
-    d = f.ds.pop(); c = f.ds.pop(); b = f.ds.pop(); a = f.ds.pop()
-    f.ds.push(d); f.ds.push(a); f.ds.push(b); f.ds.push(c)
+    c = f.ds.pop(); b = f.ds.pop(); a = f.ds.pop()
+    f.ds.push(c); f.ds.push(a); f.ds.push(b)
 
 def _over(f):
     b = f.ds.pop(); a = f.ds.pop()
@@ -377,7 +376,8 @@ def _tuck(f):
     f.ds.push(b); f.ds.push(a); f.ds.push(b)
 
 def _nip(f):
-    b = f.ds.pop(); a = f.ds.pop()
+    b = f.ds.pop()
+    f.ds.pop()
     f.ds.push(b)
 
 def _2dup(f):
@@ -405,10 +405,6 @@ def _3dup(f):
 def _clear(f):
     f.ds.data.clear()
 
-def _gt(f):
-    # placeholder replaced by DEPTH
-    pass
-
 def _depth(f):
     f.ds.push(f.ds.depth())
 
@@ -416,10 +412,6 @@ def _dot_s(f):
     # ( -- )  Dump the data stack, top first.
     items = [str(v) for v in reversed(f.ds.data)]
     f.emit(" ".join(items) if items else "empty")
-
-def _eq(f):
-    # equalcount: not standard; ignore
-    pass
 
 def _pick(f):
     n = f.ds.pop()
@@ -474,7 +466,6 @@ def _j(f):
 
 def _k(f):
     f.ds.push(f.loop_at(2)[0])
-    f.ds.push(v)
 
 
 # ---------------------------------------------------------------------------
@@ -522,10 +513,6 @@ def _fmdiv(f):
     r = n - q * nlim
     f.ds.push(to_cell(r)); f.ds.push(to_cell(q))
 
-def _fmdiscard(f):
-    _fmdiv(f)
-    f.ds.pop(); f.ds.pop()
-
 def _umdiv(f):
     # ( ud u -- r q ) unsigned double-length divide
     u = f.ds.pop(); ud_lo = f.ds.pop(); ud_hi = f.ds.pop()
@@ -534,10 +521,6 @@ def _umdiv(f):
     q = ud // u
     r = ud % u
     f.ds.push(to_cell(r)); f.ds.push(to_cell(q))
-
-def _umdiscard(f):
-    _umdiv(f)
-    f.ds.pop(); f.ds.pop()
 
 def _umdp(f):
     _umdiv(f)
@@ -695,8 +678,11 @@ def _plusbang(f):
     a = f.ds.pop(); n = f.ds.pop(); f.mem.cell_set(a, f.mem.cell_get(a) + n)
 
 def _atplus(f):
-    a = f.ds.pop(); f.ds.push(a); f.mem.cell_get  # touch
-    v = f.mem.cell_get(a); f.mem.cell_set(a, v + 1); f.ds.push(v)
+    a = f.ds.pop()
+    v = f.mem.cell_get(a)
+    f.mem.cell_set(a, v + 1)
+    f.ds.push(a)
+    f.ds.push(v)
 
 def _atminus(f):
     a = f.ds.pop()
@@ -801,11 +787,17 @@ def _numbertonumber(f):
         inn += 1
     f.ds.push(inn); f.ds.push(out); f.ds.push(a)
 
-def _hash2(f):
-    pass
-
 def _numberq(f):
-    pass
+    # ( a# -- n flag ) convert a counted string to a number in the current base.
+    a = f.ds.pop()
+    text = _read_string_at(f, a)
+    val = f.try_number(text)
+    if val is None:
+        f.ds.push(0)
+        f.ds.push(0)
+    else:
+        f.ds.push(val)
+        f.ds.push(-1)
 
 def _compile_numberq(f, toks, i):
     pass
@@ -866,7 +858,6 @@ def _expect(f):
 def _accept(f):
     a = f.ds.pop(); n = f.ds.pop()
     count = 0
-    buf = []
     while count < n:
         c = f.get_key()
         if c < 0 or c in (13, 10):
@@ -899,20 +890,11 @@ def _s_dot(f):
     f.emit(_read_string_at(f, a))
 
 def _compile_dquote(f, toks, i):
-    # ." text" : compile a push of the string address followed by S.
-    name = toks[i].value if i < len(toks) else ""
-    f.compile_state.advance_by = i + 1
-    addr = f._make_static_string(name)
+    # Kept for compatibility; ." strings are normally handled by the
+    # tokenizer (they arrive as "dotstr" tokens), so this path is rarely hit.
+    addr = f._make_static_string(toks[i].value if i < len(toks) else "")
     f.emit_cell("lit", addr)
     f.emit_prim("S.")
-
-def _s_quote(f):
-    a = f.ds.pop()
-    f.emit(_read_string_at(f, a))
-
-def _compile_s_quote(f, toks, i):
-    addr = f._make_static_string(i)  # unused; real text handled by tokenizer
-    f.emit_cell("lit", addr)
 
 def _str_at(f):
     # ( a# -- a# ) return pointer to start of string body (skip length byte)
@@ -974,8 +956,8 @@ def _compile_char(f, toks, i):
 def _noop_execute(f):
     pass
 
-def _noop_compile(f, toks, i):
-    pass
+def _noop_control(f, cells, i):
+    return i + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1002,18 +984,26 @@ def _lit_tick(f):
 
 def _compile_lit_tick(f, toks, i):
     # ['] NAME : push the entry address of NAME (for later EXECUTE)
-    name = toks[i].value.upper()
+    name = toks[i].value.upper() if i < len(toks) else ""
     f.compile_state.advance_by = i + 1
     entry = f.find(name)
     if entry is None or entry.body is None:
         raise RuntimeError(f"?NAME? {name}")
-    _exec_map[id(entry)] = entry
+    f.exec_map[id(entry)] = entry
     f.emit_cell("lit", id(entry))
 
 def _compile_compile(f, toks, i):
-    name = toks[i].value.upper()
+    # [COMPILE] NAME : compile NAME into the definition, even if it is
+    # immediate.  Control words stay runtime-scanned prim cells.
+    name = toks[i].value.upper() if i < len(toks) else ""
     f.compile_state.advance_by = i + 1
-    f.compile_word_late(name)
+    entry = f.find(name)
+    if entry is None:
+        raise RuntimeError(f"?NAME? {name}")
+    if entry.body is not None:
+        f.emit_cell("sec", name)
+    else:
+        f.emit_cell("prim", name)
 
 def _literal(f):
     pass
@@ -1047,25 +1037,13 @@ def _immediate(f):
 def _execute(f):
     # ( xt -- ) execute the secondary whose entry address is on the stack
     xt = f.ds.pop()
-    entry = _exec_map.get(xt)
-    if entry is None or entry.body is None:
-        raise RuntimeError("EXECUTE of non-secondary")
-    f.execute_body(list(entry.body))
-
-_exec_map = {}
-
-def _execute_xt(f, xt):  # kept for compatibility; unused
-    entry = _exec_map.get(xt)
+    entry = f.exec_map.get(xt)
     if entry is None or entry.body is None:
         raise RuntimeError("EXECUTE of non-secondary")
     f.execute_body(list(entry.body))
 
 def _abort(f):
-    f.ds.reset()
-    f.rs.reset()
-    f.loops.clear()
-    f.control.clear()
-    f.leave.clear()
+    f.abort()
 
 def _abort_quote(f):
     a = f.ds.pop()
@@ -1094,14 +1072,13 @@ def _word(f):
     # simplistic: read from TIB
     tib = f.uv["TIB"]
     tin = f.mem.cell_get(f.uv[">IN"])
-    out = f._make_static_string("")
     j = tin
     while j < n and chr(f.mem.cget(tib + j)) == sep:
         j += 1
     start = j
     while j < n and chr(f.mem.cget(tib + j)) != sep:
         j += 1
-    word = tib[start:j]
+    word = "".join(chr(f.mem.cget(tib + k)) for k in range(start, j))
     addr = f._make_static_string(word)
     f.ds.push(addr)
     f.mem.cell_set(f.uv[">IN"], j)
@@ -1120,15 +1097,29 @@ def _alias(f):
     pass
 
 def _compile_alias(f, toks, i):
-    # NAME1 ALIAS NAME2 : compile a call to NAME2 (resolved at runtime)
+    # NAME1 ALIAS NAME2 : make NAME2 behave like NAME1.
+    # The defining word sits between the target (NAME1) and the new name.
+    if i < 2 or i >= len(toks):
+        raise RuntimeError("ALIAS without target and name")
+    target = toks[i - 2].value.upper()
     name = toks[i].value.upper()
-    f.compile_state.advance_by = i + 1
-    entry = f.find(name)
+    entry = f.find(target)
     if entry is None:
-        raise RuntimeError(f"?NAME? {name}")
-    entry.primary = None
-    # make alias resolve to target at runtime by storing target name
-    entry._alias_target = toks[i].value.upper()
+        raise RuntimeError(f"?NAME? {target}")
+    f.compile_state.advance_by = i + 1
+    if f.compiling:
+        # Inside a definition: emit a call to the target.
+        f._flush(f.current.body)
+        if entry.body is not None:
+            f.current.body.append(["sec", target])
+        else:
+            f.current.body.append(["prim", target])
+        return
+    alias = f.new_secondary(name)
+    if entry.body is not None:
+        alias.body = [["sec", target], ["exit", 0, -1]]
+    else:
+        alias.body = [["prim", target], ["exit", 0, -1]]
 
 def _variable(f):
     pass
@@ -1456,26 +1447,50 @@ def _struct(f):
     pass
 
 def _compile_struct(f, toks, i):
+    # STRUCT n NAME : define NAME as the base cell of an n-cell block.
     nb = f.compile_state.numbuf
     if not nb:
         raise RuntimeError("STRUCT without size")
     n = nb.pop()
-    f.compile_state.struct_size = getattr(f.compile_state, "struct_size", 0) + n
+    name = toks[i].value.upper() if i < len(toks) else None
+    if not name:
+        raise RuntimeError("STRUCT without name")
+    if n < 1:
+        raise RuntimeError("STRUCT size must be at least 1")
+    f.compile_state.advance_by = i + 1
+    base = f.mem.alloc_cell()
+    for _ in range(n - 1):
+        f.mem.alloc_cell()          # reserve the remaining cells
+    # Remember the active block so FIELD can attach addresses to it.
+    f.compile_state.struct_info = [name, base, 0, n]
+    entry = f.new_secondary(name)
+    entry.body = [["lit", base], ["exit", 0, -1]]
 
 def _endstruct(f):
     pass
 
 def _compile_endstruct(f, toks, i):
-    pass
+    f.compile_state.struct_info = None
 
 def _field(f):
     pass
 
 def _compile_field(f, toks, i):
+    # FIELD NAME : define NAME as the address of the next cell of the struct.
     name = toks[i].value.upper() if i < len(toks) else ""
+    if not name:
+        raise RuntimeError("FIELD without name")
+    info = getattr(f.compile_state, "struct_info", None)
+    if not info:
+        raise RuntimeError("FIELD without STRUCT")
+    _, base, offset, size = info
+    if offset >= size:
+        raise RuntimeError("FIELD beyond STRUCT size")
     f.compile_state.advance_by = i + 1
-    size = getattr(f.compile_state, "struct_size", 0)
-    addr = f.mem.alloc_cell()
-    f.compile_state.struct_size -= min(1, size)
-    e = f.new_secondary(name)
-    e.body = [["lit", addr], ["exit", 0, -1]]
+    addr = base + offset
+    info[2] = offset + 1
+    if f.compiling:
+        f.current.body.append(["lit", addr])
+        return
+    entry = f.new_secondary(name)
+    entry.body = [["lit", addr], ["exit", 0, -1]]

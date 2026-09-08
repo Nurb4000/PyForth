@@ -200,6 +200,76 @@ class TestErrorHandling(unittest.TestCase):
         self.assertEqual(run_code("5 5 + ."), " 10 ")
 
 
+class TestFixedWords(unittest.TestCase):
+    """Regression tests for words that were previously broken."""
+
+    def test_k_nested_loops(self):
+        self.assertEqual(
+            run_code("1 3 DO 1 3 DO 1 3 DO I K . LOOP LOOP LOOP"),
+            " 1  1  1  1  2  2  2  2 ",
+        )
+
+    def test_stack_pointer_words(self):
+        # SP! / SP@ / RS@ should not crash (used to raise AttributeError).
+        self.assertEqual(run_code("0 SP! SP@ ."), " 0 ")
+        self.assertEqual(run_code("RS@ ."), " 0 ")
+
+    def test_nrot(self):
+        self.assertEqual(run_code("1 2 3 -ROT . . ."), " 2  1  3 ")
+
+    def test_dot_quote(self):
+        # A single space after ." is a separator (kept, matching S").
+        self.assertEqual(run_code('." hi there"'), " hi there")
+        self.assertEqual(run_code(': X ." hello world" ; X'), " hello world")
+
+    def test_immediate_paren_string(self):
+        # .( text) prints its text and must not touch the data stack.
+        self.assertEqual(run_code("CR .( Hello, World!)"), "\n Hello, World!")
+        self.assertEqual(run_code("1 .( x) ."), " x 1 ")
+        # Like .", the print is deferred until the compiled word runs.
+        self.assertEqual(run_code(": SAY .( hi now) ; SAY"), " hi now")
+        self.assertEqual(run_code(": SAY .( hi now) ;"), "")
+
+    def test_alias(self):
+        self.assertEqual(run_code(": FOO 42 ; FOO ALIAS BAR BAR ."), " 42 ")
+
+    def test_struct_field(self):
+        code = (
+            "2 STRUCT POINT 0 FIELD .X 1 FIELD .Y ENDSTRUCT "
+            "5 POINT ! .X @ ."
+        )
+        self.assertEqual(run_code(code), " 5 ")
+
+    def test_numberq(self):
+        self.assertEqual(run_code('S"123" NUMBER? . .'), " -1  123 ")
+        self.assertEqual(run_code('S"nope" NUMBER? . .'), " 0  0 ")
+
+    def test_abort_word(self):
+        # The ABORT word used to raise AttributeError (f.control).
+        run_code("1 2 ABORT")
+        self.assertEqual(run_code("3 4 + ."), " 7 ")
+
+    def test_abort_quote(self):
+        run_code('ABORT" boom"')
+        self.assertEqual(run_code("3 4 + ."), " 7 ")
+
+    def test_fm_um_return_quotient_and_remainder(self):
+        # FM/ / UM/M leave ( remainder quotient ); '.' prints top first.
+        self.assertEqual(run_code("7 2 FM/ . ."), " 3  1 ")
+        self.assertEqual(run_code("0 5 3 UM/M . ."), " 1  2 ")
+
+    def test_immediate_compile_words(self):
+        self.assertEqual(run_code(": FOO 5 ; : X ['] FOO EXECUTE ; X ."), " 5 ")
+        self.assertEqual(run_code(": X 42 LITERAL ; X ."), " 42 ")
+        self.assertEqual(run_code(": FOO 7 ; : X POSTPONE FOO ; X ."), " 7 ")
+        self.assertEqual(run_code(": FOO 9 ; : X [COMPILE] FOO ; X ."), " 9 ")
+
+    def test_endof_and_undo_no_crash(self):
+        self.assertEqual(
+            run_code('1 CASE 1 OF ." one" ENDOF ENDCASE'), " one"
+        )
+
+
 class TestCLI(unittest.TestCase):
     def _run_file(self, path):
         forth = Forth()
@@ -215,6 +285,61 @@ class TestCLI(unittest.TestCase):
             "hello.fs",
         )
         self.assertIn("Hello, World!", self._run_file(path))
+
+    def test_run_temperature_example(self):
+        # The F>C converter example must produce the expected conversions.
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "examples",
+            "temperature.fs",
+        )
+        output = self._run_file(path)
+        self.assertIn("Celsius:     100", output)
+        self.assertIn("Celsius:     36", output)
+        self.assertIn("Celsius:     0", output)
+
+    def test_batch_multiple_files(self):
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        first = os.path.join(tmpdir, "first.fs")
+        second = os.path.join(tmpdir, "second.fs")
+        with open(first, "w") as handle:
+            handle.write("11 .\n")
+        with open(second, "w") as handle:
+            handle.write("22 .\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["-b", first, second])
+        self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertIn("11", output)
+        self.assertIn("22", output)
+
+    def test_repl_multiline_definition_single_ok(self):
+        # A ": ... ;" spread over several pasted lines must announce only one
+        # "ok", and comment/empty lines must stay silent.
+        buf = io.StringIO()
+        inp = io.StringIO(
+            "\\ comment line\n\n"
+            ": F>C\n"
+            "32 -\n"
+            "5 *\n"
+            "9 /\n"
+            ";\n"
+            "212 F>C .\n"
+            "bye\n"
+        )
+        with redirect_stdout(buf):
+            cli.repl(Forth(), infile=inp, outfile=buf)
+        self.assertEqual(buf.getvalue(), "ok\n 100 ok\n")
+
+    def test_repl_bye_quits(self):
+        for word in ("bye", "quit"):
+            buf = io.StringIO()
+            inp = io.StringIO("1 2 + .\n{}\n".format(word))
+            with redirect_stdout(buf):
+                cli.repl(Forth(), infile=inp, outfile=buf)
+            self.assertEqual(buf.getvalue(), " 3 ok\n")
 
 
 class TestWeb(unittest.TestCase):
@@ -233,6 +358,14 @@ class TestWeb(unittest.TestCase):
         data = resp.get_json()
         self.assertIsNone(data["error"])
         self.assertIn("10", data["output"])
+
+    def test_multi_line_run_endpoint(self):
+        # Definitions and loops may span several lines in the web UI.
+        code = ": SQUARE 2 ** ;\n1 5 DO I SQUARE . LOOP"
+        resp = self.client.post("/api/run", json={"code": code})
+        data = resp.get_json()
+        self.assertIsNone(data["error"])
+        self.assertIn(" 1  4  9  16 ", data["output"])
 
     def test_error_endpoint(self):
         resp = self.client.post("/api/run", json={"code": ". "})
