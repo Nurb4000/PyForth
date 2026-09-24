@@ -291,6 +291,13 @@ class Tokenizer:
 # Primary (built-in) words
 # ---------------------------------------------------------------------------
 
+class _ExitSignal(Exception):
+    """Raised by an explicit ``EXIT`` word to unwind out of the current
+    definition.  Control-structure region scans (IF/THEN, DO/LOOP, ...) are
+    implemented with recursive ``exec_tokens`` calls, so a plain ``return``
+    from a region is not enough to terminate the enclosing word; this signal
+    propagates until the nearest ``execute_body`` boundary swallows it."""
+
 class Primary:
     """A built-in word.  ``execute`` runs it in interpret mode; ``compile``
     (optional) runs it while compiling a secondary definition."""
@@ -788,7 +795,10 @@ class Forth:
         entry.primary.execute(self)
 
     def execute_body(self, body):
-        self.exec_tokens(body, 0, len(body))
+        try:
+            self.exec_tokens(body, 0, len(body))
+        except _ExitSignal:
+            pass
 
     # -- unified token/cell executor --------------------------------------
     # A "cell" is a small list [tag, value] where tag is one of:
@@ -823,6 +833,8 @@ class Forth:
                 i += 1
             elif tag == "exit":
                 return i
+            elif tag == "exitnow":
+                raise _ExitSignal()
             elif tag == "ploop":
                 raise ForthError("+LOOP without DO")
             else:  # prim

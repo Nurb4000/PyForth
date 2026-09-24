@@ -101,6 +101,8 @@ def register_words(f):
     add(".S", P(_dot_s))
     add("PICK", P(_pick, compile=_compile_pick))
     add(".ROT", P(_dotrot))
+    add("2ROT", P(_two_rot))
+    add("ROLL", P(_roll))
 
     # n.PICK and n.ROT families
     for _n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30):
@@ -117,6 +119,10 @@ def register_words(f):
     add("R>", P(_r_from))
     add("R@", P(_r_peek))
     add(">R?", P(_gt_r_q))
+    add("2>R", P(_two_gt_r))
+    add("2R>", P(_two_r_from))
+    add("2R@", P(_two_r_peek))
+    add("RDROP", P(_r_drop))
 
     # =======================================================================
     # Arithmetic
@@ -145,11 +151,46 @@ def register_words(f):
             q = -q
         r = a - q * b
         f.ds.push(to_cell(r))
+
+    def _slash_mod(f):
+        # ( n1 n2 -- rem quot )  same convention as '/' and MOD
+        b = f.ds.pop(); a = f.ds.pop()
+        if b == 0: raise RuntimeError("division by zero")
+        q = abs(a) // abs(b)
+        if (a < 0) != (b < 0):
+            q = -q
+        r = a - q * b
+        f.ds.push(to_cell(r))
+        f.ds.push(to_cell(q))
+
+    def _star_slash_mod(f):
+        # ( n1 n2 n3 -- rem quot )  n1 * n2 / n3, product kept full-size
+        n3 = f.ds.pop(); n2 = f.ds.pop(); n1 = f.ds.pop()
+        if n3 == 0: raise RuntimeError("division by zero")
+        prod = n1 * n2
+        q = abs(prod) // abs(n3)
+        if (prod < 0) != (n3 < 0):
+            q = -q
+        f.ds.push(to_cell(prod - q * n3))
+        f.ds.push(to_cell(q))
+
+    def _star_slash(f):
+        # ( n1 n2 n3 -- n4 )  n1 * n2 / n3 without intermediate overflow
+        n3 = f.ds.pop(); n2 = f.ds.pop(); n1 = f.ds.pop()
+        if n3 == 0: raise RuntimeError("division by zero")
+        prod = n1 * n2
+        q = abs(prod) // abs(n3)
+        if (prod < 0) != (n3 < 0):
+            q = -q
+        f.ds.push(to_cell(q))
     add("+", P(_add))
     add("-", P(_sub))
     add("*", P(_mul))
     add("/", P(_div))
     add("MOD", P(_mod))
+    add("/MOD", P(_slash_mod))
+    add("*/MOD", P(_star_slash_mod))
+    add("*/", P(_star_slash))
     add("NEGATE", P(lambda f: f.ds.push(to_cell(-f.ds.peek()))))
     add("ABS", P(_abs))
     add("2*", P(lambda f: f.ds.push(to_cell(f.ds.pop() * 2))))
@@ -206,6 +247,7 @@ def register_words(f):
     add("1<", P(_one_lt))
     add("2>", P(_two_gt))
     add("<DUP", P(_lt_dup))
+    add("WITHIN", P(_within))
 
     # =======================================================================
     # Bitwise
@@ -236,6 +278,15 @@ def register_words(f):
     add("HERE", P(_here))
     add(",", P(_comma))
     add("C,", P(_c_comma))
+    add("CMOVE", P(_cmove))
+    add("CMOVE>", P(_cmove_up))
+    add("FILL", P(_fill))
+    add("ERASE", P(_erase))
+    add("BLANK", P(_blank))
+    add("BOUNDS", P(_bounds))
+    add("CELLS", P(_cells))
+    add("CELL+", P(_cell_plus))
+    add("CHARS", P(_cells))
 
     # =======================================================================
     # Data stack info words
@@ -275,6 +326,8 @@ def register_words(f):
     add(".", P(_dot))
     add("?.", P(_qdot))
     add("S.", P(_s_dot))
+    add(".R", P(_dot_r))
+    add("U.R", P(_u_dot_r))
     add("EMIT", P(_emit))
     add("TYPE", P(_type))
     add("SPACE", P(lambda f: f.emit(" ")))
@@ -308,6 +361,8 @@ def register_words(f):
     add("LITERAL", P(_literal, compile=_compile_literal), immediate=True)
     add("POSTPONE", P(_postpone, compile=_compile_postpone), immediate=True)
     add("IMMEDIATE", P(_immediate), immediate=True)
+    add("EXIT", P(_exit, compile=_compile_exit), immediate=True)
+    add("RECURSE", P(_recurse, compile=_compile_recurse), immediate=True)
     add("EXECUTE", P(_execute))
     add("ABORT", P(_abort))
     add("ABORT\"", P(_abort_quote, compile=_compile_abort_quote))
@@ -454,6 +509,30 @@ def _dotrot(f):
     c = f.ds.pop(); b = f.ds.pop(); a = f.ds.pop()
     f.ds.push(c); f.ds.push(a); f.ds.push(b)
 
+def _two_rot(f):
+    # ( x1 x2 x3 x4 x5 x6 -- x3 x4 x5 x6 x1 x2 )
+    if f.ds.depth() < 6:
+        raise ForthError("data stack underflow")
+    x1 = f.ds.data[-6]
+    x2 = f.ds.data[-5]
+    del f.ds.data[-6:-4]
+    f.ds.data.append(x1)
+    f.ds.data.append(x2)
+
+def _roll(f):
+    # ( xu ... x0 u -- xu-1 ... x0 xu )  move the u-th item to the top
+    u = f.ds.pop()
+    if u < 0:
+        raise RuntimeError("ROLL: negative depth")
+    if u == 0:
+        f.ds.push(f.ds.peek())
+        return
+    if u >= f.ds.depth():
+        raise ForthError("data stack underflow")
+    item = f.ds.data[-u - 1]
+    del f.ds.data[-u - 1]
+    f.ds.data.append(item)
+
 def _gt_r(f):
     v = f.ds.pop()
     f.rs.push(v)
@@ -463,6 +542,29 @@ def _r_from(f):
 
 def _r_peek(f):
     f.ds.push(f.rs.peek())
+
+def _two_gt_r(f):
+    # ( x1 x2 -- ) ( R: -- x1 x2 )
+    x2 = f.ds.pop(); x1 = f.ds.pop()
+    f.rs.push(x1)
+    f.rs.push(x2)
+
+def _two_r_from(f):
+    # ( R: x1 x2 -- ) ( -- x1 x2 )
+    x2 = f.rs.pop(); x1 = f.rs.pop()
+    f.ds.push(x1)
+    f.ds.push(x2)
+
+def _two_r_peek(f):
+    # ( R: x1 x2 -- R: x1 x2 ) ( -- x1 x2 )  2R@ - copy without removing
+    x1 = f.rs.peek(1)
+    x2 = f.rs.peek(0)
+    f.ds.push(x1)
+    f.ds.push(x2)
+
+def _r_drop(f):
+    # drop the top item from the return stack
+    f.rs.pop()
 
 def _gt_r_q(f):
     v = f.ds.pop()
@@ -649,6 +751,11 @@ def _ltz(f):
 def _gtz(f):
     a = f.ds.pop(); f.ds.push(to_cell(-1 if a > 0 else 0))
 
+def _within(f):
+    # ( x lo hi -- flag )  true if lo <= x < hi
+    hi = f.ds.pop(); lo = f.ds.pop(); x = f.ds.pop()
+    f.ds.push(to_cell(-1 if lo <= x < hi else 0))
+
 def _neq0(f):
     a = f.ds.pop(); f.ds.push(to_cell(-1 if a != 0 else 0))
 
@@ -783,6 +890,61 @@ def _c_comma(f):
     f.mem.next_cell_addr += 1
 
 
+def _cmove(f):
+    # ( src dst u -- ) copy u bytes from src to dst (forward)
+    u = f.ds.pop(); dst = f.ds.pop(); src = f.ds.pop()
+    cget = f.mem.cget; cset = f.mem.cset
+    for j in range(u):
+        cset(dst + j, cget(src + j))
+
+
+def _cmove_up(f):
+    # ( src dst u -- ) copy u bytes from src to dst (backward, overlap-safe)
+    u = f.ds.pop(); dst = f.ds.pop(); src = f.ds.pop()
+    cget = f.mem.cget; cset = f.mem.cset
+    for j in range(u - 1, -1, -1):
+        cset(dst + j, cget(src + j))
+
+
+def _fill(f):
+    # ( addr u char -- ) store char in u bytes starting at addr
+    ch = f.ds.pop() & 0xFF
+    u = f.ds.pop(); a = f.ds.pop()
+    for j in range(u):
+        f.mem.cset(a + j, ch)
+
+
+def _erase(f):
+    # ( addr u -- ) store zeros in u bytes starting at addr
+    u = f.ds.pop(); a = f.ds.pop()
+    for j in range(u):
+        f.mem.cset(a + j, 0)
+
+
+def _blank(f):
+    # ( addr u -- ) store spaces in u bytes starting at addr
+    u = f.ds.pop(); a = f.ds.pop()
+    for j in range(u):
+        f.mem.cset(a + j, 32)
+
+
+def _bounds(f):
+    # ( addr u -- addr+u addr )
+    u = f.ds.pop(); a = f.ds.pop()
+    f.ds.push(a + u)
+    f.ds.push(a)
+
+
+def _cells(f):
+    # ( n -- n ) a cell occupies one address in this implementation
+    pass
+
+
+def _cell_plus(f):
+    # ( a-addr -- a-addr+1 )
+    f.ds.push(f.ds.pop() + 1)
+
+
 # ---------------------------------------------------------------------------
 # Stack pointer words
 # ---------------------------------------------------------------------------
@@ -879,6 +1041,20 @@ def _qdot(f):
     n = f.ds.pop()
     base = f.mem.cell_get(f.uv["BASE"])
     f.emit(" " + _number_to_str(f, n, base) + " ")
+
+def _dot_r(f):
+    # ( n width -- ) right-justified signed display in field of 'width'
+    width = f.ds.pop(); n = f.ds.pop()
+    base = f.mem.cell_get(f.uv["BASE"])
+    s = _number_to_str(f, n, base)
+    f.emit(" " * max(0, width - len(s)) + s)
+
+def _u_dot_r(f):
+    # ( u width -- ) right-justified unsigned display in field of 'width'
+    width = f.ds.pop(); n = f.ds.pop()
+    base = f.mem.cell_get(f.uv["BASE"])
+    s = _number_to_str(f, abs(n), base)
+    f.emit(" " * max(0, width - len(s)) + s)
 
 def _emit(f):
     c = f.ds.pop() & 0xFF
@@ -1092,6 +1268,31 @@ def _immediate(f):
     if f.last_word is None:
         raise RuntimeError("IMMEDIATE without a definition")
     f.last_word.immediate = True
+
+def _exit(f):
+    raise ForthError("EXIT outside a definition")
+
+def _compile_exit(f, toks, i):
+    # EXIT : end the current word early.  The cell carries the 'exitnow' tag
+    # (rather than the ';' terminator's 'exit') so it unwinds even when it
+    # appears inside an IF / DO region.  Flush pending numbers first so the
+    # stack values keep their place.
+    dest = f.current.body if f.current is not None else None
+    if dest is None:
+        raise ForthError("EXIT outside a definition")
+    f._flush(dest)
+    dest.append(["exitnow", 0, -1])
+
+def _recurse(f):
+    raise ForthError("RECURSE outside a definition")
+
+def _compile_recurse(f, toks, i):
+    # RECURSE : call the word that is currently being compiled
+    cur = f.current
+    if cur is None or cur.body is None:
+        raise ForthError("RECURSE outside a definition")
+    f._flush(cur.body)
+    cur.body.append(["sec", cur.name])
 
 def _execute(f):
     # ( xt -- ) execute the word whose entry address is on the stack

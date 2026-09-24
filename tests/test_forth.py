@@ -708,6 +708,106 @@ class TestRegression(unittest.TestCase):
         with self.assertRaises(ForthError):
             run_code("INCLUDE this_file_does_not_exist.fs")
 
+    # -- batch 2: ROLL/2ROT, /MOD family, R-stack pairs, WITHIN ------------
+
+    def test_two_rot(self):
+        self.assertEqual(run_code("1 2 3 4 5 6 2ROT . . . . . ."),
+                         " 2  1  6  5  4  3 ")
+
+    def test_roll(self):
+        self.assertEqual(run_code("5 4 3 2 1 4 ROLL . . . . ."),
+                         " 5  1  2  3  4 ")
+
+    def test_slash_mod(self):
+        self.assertEqual(run_code("-7 3 /MOD . ."), " -2  -1 ")
+        self.assertEqual(run_code("7 3 /MOD . ."), " 2  1 ")
+        with self.assertRaises(RuntimeError):
+            run_code("1 0 /MOD")
+
+    def test_star_slash_family(self):
+        self.assertEqual(run_code("6 7 3 */MOD . ."), " 14  0 ")
+        self.assertEqual(run_code("6 -7 3 */ ."), " -14 ")
+        with self.assertRaises(RuntimeError):
+            run_code("6 7 0 */")
+
+    def test_double_return_stack(self):
+        self.assertEqual(run_code("1 2 2>R 2R> . ."), " 2  1 ")
+        self.assertEqual(run_code("1 2 2>R 2R@ + ."), " 3 ")
+        self.assertEqual(run_code("1 2 2>R RDROP R> ."), " 1 ")
+
+    def test_within(self):
+        self.assertEqual(run_code("5 0 10 WITHIN ."), " -1 ")
+        self.assertEqual(run_code("0 0 10 WITHIN ."), " -1 ")
+        self.assertEqual(run_code("10 0 10 WITHIN ."), " 0 ")
+        self.assertEqual(run_code("11 0 10 WITHIN ."), " 0 ")
+        self.assertEqual(run_code("-3 -5 0 WITHIN ."), " -1 ")
+
+    # -- batch 2: CMOVE/CMOVE>/FILL/ERASE/BLANK/BOUNDS/CELLS --------------
+
+    def test_cmove_forward(self):
+        self.assertEqual(run_code("65 100 C! 66 101 C! 67 102 C! "
+                                  "100 200 3 CMOVE "
+                                  "200 C@ . 201 C@ . 202 C@ ."),
+                         " 65  66  67 ")
+
+    def test_cmove_backward_and_overlap(self):
+        self.assertEqual(run_code("65 200 C! 66 201 C! 67 202 C! "
+                                  "200 100 3 CMOVE> "
+                                  "100 C@ . 101 C@ . 102 C@ ."),
+                         " 65  66  67 ")
+        # overlapping same-buffer copy: shift a run right by one
+        self.assertEqual(run_code("66 201 C! 66 202 C! "
+                                  "201 200 2 CMOVE> "
+                                  "200 C@ . 201 C@ ."),
+                         " 66  66 ")
+
+    def test_fill_erase_blank(self):
+        forth = Forth()
+        forth.run("HERE 3 64 FILL HERE C@ . HERE 1+ C@ .")
+        self.assertEqual(forth.output_text(), " 64  64 ")
+        forth = Forth()
+        forth.run("HERE 3 64 FILL HERE 3 ERASE HERE C@ . HERE 1+ C@ .")
+        self.assertEqual(forth.output_text(), " 0  0 ")
+        forth = Forth()
+        forth.run("HERE 3 BLANK HERE C@ .")
+        self.assertEqual(forth.output_text(), " 32 ")
+
+    def test_bounds_cells(self):
+        self.assertEqual(run_code("100 10 BOUNDS - ."), " 10 ")
+        self.assertEqual(run_code("100 10 BOUNDS ."), " 100 ")
+        self.assertEqual(run_code("100 CELLS CELL+ ."), " 101 ")
+
+    def test_dot_r_forms(self):
+        self.assertEqual(run_code("5 3 .R"), "  5")
+        self.assertEqual(run_code("-5 3 .R"), " -5")
+        self.assertEqual(run_code("12345 3 .R"), "12345")
+        self.assertEqual(run_code("-5 3 U.R"), "  5")
+        self.assertEqual(run_code("5 4 U.R"), "   5")
+
+    # -- batch 2: EXIT / RECURSE ------------------------------------------
+
+    def test_exit_aborts_top_of_definition(self):
+        self.assertEqual(run_code(": A 10 EXIT 99 ; A ."), " 10 ")
+
+    def test_exit_inside_if(self):
+        self.assertEqual(run_code(": C DUP 1 = IF EXIT THEN DROP 77 ;"
+                                  " 1 C ."), " 1 ")
+        self.assertEqual(run_code(": C DUP 1 = IF EXIT THEN DROP 77 ;"
+                                  " 2 C ."), " 77 ")
+
+    def test_exit_inside_do(self):
+        self.assertEqual(run_code(": D 1 10 DO I . EXIT LOOP 99 ; D"),
+                         " 1 ")
+
+    def test_exit_outside_definition_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("EXIT")
+
+    def test_recurse(self):
+        code = ": F DUP 1 = IF DROP 1 EXIT THEN DUP 1- F * ;"
+        self.assertEqual(run_code(code + " 5 F ."), " 120 ")
+        self.assertEqual(run_code(code + " 1 F ."), " 1 ")
+
     # -- invalid-program recovery across a whole file ------------------------
 
     def test_error_does_not_corrupt_dictionary(self):
