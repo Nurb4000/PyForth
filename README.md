@@ -189,3 +189,5 @@ forth/            interpreter package
 examples/         runnable .fs programs
 tests/            unittest suite
 ```
+Web interface screenshot:
+<img width="967" height="934" alt="image" src="https://github.com/user-attachments/assets/d6792072-6e81-4dd9-872a-9418de815a84" />

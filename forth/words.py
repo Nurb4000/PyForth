@@ -8,8 +8,13 @@ by :func:`register_words` onto a :class:`forth.machine.Forth` instance.
 from __future__ import annotations
 
 import math
+import sys
 
-from .machine import Primary, to_cell, CELL_MASK
+from .machine import Primary, to_cell, CELL_MASK, ForthError
+
+
+class _LeaveSignal(Exception):
+    """Internal exception used to unwind a DO...LOOP when LEAVE executes."""
 
 
 # ---------------------------------------------------------------------------
@@ -33,28 +38,25 @@ def _write_string_to_mem(f, text, addr):
 
 def _number_to_str(f, n, base):
     """Format a (possibly signed) cell in the given base."""
+    if base < 2:
+        raise RuntimeError("BASE too small")
+    if base > 36:
+        raise RuntimeError("BASE too large")
     neg = n < 0
     if neg:
         n = -n
-    if base == 10:
-        digits = "0123456789ABCDEF"
-    elif base == 16:
-        digits = "0123456789ABCDEF"
-    elif base == 8:
-        digits = "01234567"
-    elif base == 2:
-        digits = "01"
-    else:
-        digits = "0123456789ABCDEF"
     if n == 0:
         s = "0"
     else:
         out = []
         while n > 0:
-            out.insert(0, digits[n % base])
+            out.insert(0, _DIGITS[n % base])
             n //= base
         s = "".join(out)
     return "-" + s if neg else s
+
+
+_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def _pad(f):
@@ -81,6 +83,7 @@ def register_words(f):
     # Stack manipulation
     # =======================================================================
     add("DUP", P(lambda f: f.ds.push(f.ds.peek())))
+    add("?DUP", P(_q_dup))
     add("DROP", P(lambda f: f.ds.pop()))
     add("SWAP", P(_swap))
     add("ROT", P(_rot))
@@ -270,6 +273,7 @@ def register_words(f):
     add("EMIT", P(_emit))
     add("TYPE", P(_type))
     add("SPACE", P(lambda f: f.emit(" ")))
+    add("BL", P(lambda f: f.ds.push(ord(" "))))
     add("SPACES", P(_spaces))
     add("CR", P(lambda f: f.emit("\n")))
     add("PAGE", P(lambda f: f.emit("\n\n")))
@@ -500,7 +504,11 @@ def _fmul(f):
 def _fdiv(f):
     b = f.ds.pop(); a = f.ds.pop()
     if b == 0: raise RuntimeError("division by zero")
-    f.ds.push(to_cell(a // b))
+    # like '/': result truncated toward zero
+    q = abs(a) // abs(b)
+    if (a < 0) != (b < 0):
+        q = -q
+    f.ds.push(to_cell(q))
 
 def _fmdiv(f):
     # ( n1 n2 -- r q ) signed divide: quotient truncated toward zero,
@@ -536,8 +544,8 @@ def _plusdiv(f):
 def _minusdiv(f):
     b = f.ds.pop(); a = f.ds.pop()
     if b == 0: raise RuntimeError("division by zero")
-    # round toward negative infinity
-    f.ds.push(to_cell(-((-a) // b)))
+    # round toward negative infinity (Python's '//' is floor division)
+    f.ds.push(to_cell(a // b))
 
 def _sqrt(f):
     a = f.ds.pop()
@@ -562,16 +570,29 @@ def _trunc(f):
 
 def _pow(f):
     b = f.ds.pop(); a = f.ds.pop()
-    f.ds.push(to_cell(int(a ** b)))
+    try:
+        f.ds.push(to_cell(int(a ** b)))
+    except (ValueError, OverflowError, ZeroDivisionError):
+        raise RuntimeError("POW out of range") from None
 
 def _exp(f):
-    a = f.ds.pop(); f.ds.push(to_cell(int(math.exp(a))))
+    a = f.ds.pop()
+    try:
+        f.ds.push(to_cell(int(math.exp(a))))
+    except OverflowError:
+        raise RuntimeError("EXP out of range") from None
 
 def _ln(f):
-    a = f.ds.pop(); f.ds.push(to_cell(int(math.log(a))))
+    a = f.ds.pop()
+    if a <= 0:
+        raise RuntimeError("LN of non-positive")
+    f.ds.push(to_cell(int(math.log(a))))
 
 def _log(f):
-    a = f.ds.pop(); f.ds.push(to_cell(int(math.log10(a))))
+    a = f.ds.pop()
+    if a <= 0:
+        raise RuntimeError("LOG of non-positive")
+    f.ds.push(to_cell(int(math.log10(a))))
 
 def _sin(f):
     a = f.ds.pop(); f.ds.push(to_cell(int(math.sin(a))))
@@ -625,15 +646,26 @@ def _neq0(f):
     a = f.ds.pop(); f.ds.push(to_cell(-1 if a != 0 else 0))
 
 def _one_lt(f):
-    # ( n -- 0<n<1 ? ) not standard; implement as 1 < n
-    a = f.ds.pop(); f.ds.push(to_cell(-1 if 1 < a else 0))
+    # ( n -- flag ) true if n is less than one
+    a = f.ds.pop(); f.ds.push(to_cell(-1 if a < 1 else 0))
 
 def _two_gt(f):
-    a = f.ds.pop(); f.ds.push(to_cell(-1 if 2 > a else 0))
+    # ( n -- flag ) true if n is greater than two
+    a = f.ds.pop(); f.ds.push(to_cell(-1 if a > 2 else 0))
 
 def _lt_dup(f):
-    # ( n -- n n ) if n<0 ; used by some number routines - no-op placeholder
-    a = f.ds.pop(); f.ds.push(a); f.ds.push(a)
+    # ( n -- n n ) duplicate n only if it is non-zero
+    a = f.ds.pop()
+    if a != 0:
+        f.ds.push(a); f.ds.push(a)
+    else:
+        f.ds.push(a)
+
+def _q_dup(f):
+    # ( n -- n [n] ) duplicate only if non-zero
+    a = f.ds.peek()
+    if a != 0:
+        f.ds.push(a)
 
 
 # ---------------------------------------------------------------------------
@@ -644,10 +676,16 @@ def _xor(f):
     b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(a ^ b))
 
 def _lshift(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(a << b))
+    b = f.ds.pop(); a = f.ds.pop()
+    if b < 0:
+        raise RuntimeError("LSHIFT by negative count")
+    f.ds.push(to_cell(a << b))
 
 def _rshift(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(a >> b))
+    b = f.ds.pop(); a = f.ds.pop()
+    if b < 0:
+        raise RuntimeError("RSHIFT by negative count")
+    f.ds.push(to_cell(a >> b))
 
 def _ulshift(f):
     b = f.ds.pop(); a = f.ds.pop()
@@ -695,10 +733,10 @@ def _c_bang(f):
     a = f.ds.pop(); v = f.ds.pop(); f.mem.cset(a, v)
 
 def _chain(f):
-    # ( a1 a2 -- ) copy string from a2 into a1 (length from a2's length byte)
+    # ( a1 a2 -- ) copy string from a2 into a1 (length byte + all body bytes)
     b = f.ds.pop(); a = f.ds.pop()
     n = f.mem.cget(b)
-    for j in range(n):
+    for j in range(n + 1):
         f.mem.cset(a + j, f.mem.cget(b + j))
 
 
@@ -736,43 +774,19 @@ def _compile_base_prefix(f, toks, i):
 # ---------------------------------------------------------------------------
 
 def _hash(f):
-    # ( n -- n' ) emit one digit of n in current base into PAD
+    # ( n -- 0 ) convert n to its textual form in the current base and store it
+    # in PAD as a counted string; the pushed zero acts as the "done" marker.
     n = f.ds.pop()
     base = f.mem.cell_get(f.uv["BASE"])
-    if n < 0:
-        f.emit("-")
-        n = -n
-    if n == 0:
-        f.emit("0")
-    else:
-        while n > 0:
-            n, r = divmod(n, base)
-            f.emit(chr(ord("0") + r if r < 10 else ord("A") + r - 10))
-    f.ds.push(to_cell(n))
+    _write_string_to_mem(f, _number_to_str(f, n, base), _pad(f))
+    f.ds.push(0)
 
 def _hashs(f):
-    while f.ds.peek() != 0:
-        _hash(f)
-    # drop the zero
-    f.ds.pop()
+    # ( n -- 0 ) convert the full value (not just one digit) into PAD.
+    return _hash(f)
 
 def _hashgt(f):
-    # ( n -- a# ) convert n (already in PAD) to a NUL-terminated string
-    base = f.mem.cell_get(f.uv["BASE"])
-    n = f.ds.pop()
-    if n < 0:
-        f.mem.cset(_pad(f), ord("-") & 0xFF)
-    else:
-        f.mem.cset(_pad(f), 0)
-    if n == 0:
-        f.mem.cset(_pad(f) + 1, ord("0") & 0xFF)
-    else:
-        pos = 0
-        while n > 0:
-            n, r = divmod(n, base)
-            ch = chr(ord("0") + r) if r < 10 else chr(ord("A") + r - 10)
-            f.mem.cset(_pad(f) + 1 + pos, ord(ch) & 0xFF)
-            pos += 1
+    # ( -- a# ) hand back the address of the converted string in PAD.
     f.ds.push(_pad(f))
 
 def _numbertonumber(f):
@@ -840,7 +854,7 @@ def _key(f):
     f.ds.push(to_cell(c))
 
 def _expect(f):
-    a = f.ds.pop(); n = f.ds.pop()
+    n = f.ds.pop(); a = f.ds.pop()
     count = 0
     while count < n:
         c = f.get_key()
@@ -848,7 +862,7 @@ def _expect(f):
             break
         if c in (13, 10):
             break
-        f.mem.cset(a + count, c & 0xFF)
+        f.mem.cset(a + 1 + count, c & 0xFF)
         count += 1
     f.mem.cset(a, count)
     f.mem.cell_set(f.uv["SPAN"], count)
@@ -856,7 +870,7 @@ def _expect(f):
     f.ds.push(count)
 
 def _accept(f):
-    a = f.ds.pop(); n = f.ds.pop()
+    n = f.ds.pop(); a = f.ds.pop()
     count = 0
     while count < n:
         c = f.get_key()
@@ -865,17 +879,16 @@ def _accept(f):
         f.mem.cset(a + count, c & 0xFF)
         count += 1
     f.mem.cell_set(f.uv["SPAN"], count)
+    f.ds.push(count)
 
 def _readline(f):
-    a = f.ds.pop(); n = f.ds.pop()
+    n = f.ds.pop(); a = f.ds.pop()
     count = 0
     while count < n:
         c = f.get_key()
-        if c < 0 or c == 13:
+        if c < 0 or c in (13, 10):
             break
-        if c == 10:
-            break
-        f.mem.cset(a + count, c & 0xFF)
+        f.mem.cset(a + 1 + count, c & 0xFF)
         count += 1
     f.mem.cset(a, count)
     f.ds.push(a)
@@ -902,10 +915,10 @@ def _str_at(f):
     f.ds.push(a)
 
 def _str_bang(f):
-    # ( a# s# -- ) copy string s# into a#
+    # ( a# s# -- ) copy counted string s# into a# (length byte + body)
     dst = f.ds.pop(); src = f.ds.pop()
     n = f.mem.cget(src)
-    for j in range(n):
+    for j in range(n + 1):
         f.mem.cset(dst + j, f.mem.cget(src + j))
 
 def _len(f):
@@ -987,7 +1000,7 @@ def _compile_lit_tick(f, toks, i):
     name = toks[i].value.upper() if i < len(toks) else ""
     f.compile_state.advance_by = i + 1
     entry = f.find(name)
-    if entry is None or entry.body is None:
+    if entry is None:
         raise RuntimeError(f"?NAME? {name}")
     f.exec_map[id(entry)] = entry
     f.emit_cell("lit", id(entry))
@@ -1010,9 +1023,10 @@ def _literal(f):
 
 def _compile_literal(f, toks, i):
     nb = f.compile_state.numbuf
-    if not nb:
-        raise RuntimeError("LITERAL without operand")
-    value = nb.pop()
+    if nb:
+        value = nb.pop()
+    else:
+        value = f.ds.pop()
     f.emit_cell("lit", to_cell(value))
 
 def _postpone(f):
@@ -1028,6 +1042,8 @@ def _compile_postpone(f, toks, i):
         f.emit_cell("sec", name)
     elif entry.primary and entry.primary.compile is not None:
         entry.primary.compile(f, toks, i)
+    else:
+        f.emit_cell("prim", name)
 
 def _immediate(f):
     if f.last_word is None:
@@ -1035,19 +1051,27 @@ def _immediate(f):
     f.last_word.immediate = True
 
 def _execute(f):
-    # ( xt -- ) execute the secondary whose entry address is on the stack
+    # ( xt -- ) execute the word whose entry address is on the stack
     xt = f.ds.pop()
     entry = f.exec_map.get(xt)
-    if entry is None or entry.body is None:
-        raise RuntimeError("EXECUTE of non-secondary")
-    f.execute_body(list(entry.body))
+    if entry is None:
+        raise RuntimeError("EXECUTE of unknown xt")
+    if entry.body is not None:
+        f.execute_body(list(entry.body))
+    elif entry.primary is not None:
+        entry.primary.execute(f)
+    else:
+        raise RuntimeError("EXECUTE of non-executable")
 
 def _abort(f):
     f.abort()
+    raise ForthError("ABORT")
 
 def _abort_quote(f):
     a = f.ds.pop()
-    f.emit(_read_string_at(f, a))
+    msg = _read_string_at(f, a)
+    f.abort()
+    raise ForthError(msg)
 
 def _compile_abort_quote(f, toks, i):
     name = toks[i].value if i < len(toks) else ""
@@ -1055,32 +1079,52 @@ def _compile_abort_quote(f, toks, i):
     # compile a string push + abort at runtime
     addr = f._make_static_string(name)
     f.emit_cell("lit", addr)
-    f.emit_prim("STR@")
-    f.emit_prim("ABORT")
+    f.emit_prim("ABORT\"")
 
 def _question(f):
-    # ( -- ) read a line and interpret it (used by web/CLI "?")
-    line = input("? ")
+    # ( -- ) read a line and interpret it (used by web/CLI "?").
+    # Prefer the machine's own (non-blocking) input buffer so a browser
+    # session never blocks on stdin; fall back to a real terminal prompt
+    # only when running interactively.
+    line = None
+    if f.key_available():
+        chars = []
+        while f.key_available():
+            c = f.get_key()
+            if c in (13, 10):
+                break
+            chars.append(chr(c))
+        line = "".join(chars)
+    elif sys.stdin.isatty():
+        try:
+            line = input("? ")
+        except (EOFError, OSError):
+            line = None
+    if line is None:
+        raise ForthError("? no input")
     f.interpret(line)
 
 def _word(f):
-    # ( a# -- a# word ) read next word from input buffer at a#
-    a = f.ds.pop()
-    n = f.mem.cget(a)
-    # find separator
-    sep = chr(f.mem.cget(a)) if n > 0 else " "
-    # simplistic: read from TIB
+    # ( char -- c-addr ) parse the next whitespace-free token from the TIB,
+    # skipping leading occurrences of char, and store it in PAD as a counted
+    # string.  >IN is advanced past the terminating delimiter.
+    delim = chr(f.ds.pop() & 0xFF)
     tib = f.uv["TIB"]
+    n = f.mem.cell_get(f.uv["TLEN"])
     tin = f.mem.cell_get(f.uv[">IN"])
     j = tin
-    while j < n and chr(f.mem.cget(tib + j)) == sep:
+    while j < n and chr(f.mem.cget(tib + j)) == delim:
         j += 1
     start = j
-    while j < n and chr(f.mem.cget(tib + j)) != sep:
+    while j < n and chr(f.mem.cget(tib + j)) != delim:
         j += 1
     word = "".join(chr(f.mem.cget(tib + k)) for k in range(start, j))
-    addr = f._make_static_string(word)
-    f.ds.push(addr)
+    # the terminating delimiter is consumed; if we hit the end of the buffer
+    # the parsed token ends there too.
+    if j < n:
+        j += 1
+    _write_string_to_mem(f, word, f.uv["PAD"])
+    f.ds.push(f.uv["PAD"])
     f.mem.cell_set(f.uv[">IN"], j)
 
 def _interpret(f):
@@ -1089,9 +1133,9 @@ def _interpret(f):
     f.interpret(text)
 
 def _source(f):
-    # ( -- a# ) return source buffer info
+    # ( -- c-addr u ) address and length of the current input buffer (TIB)
     f.ds.push(f.uv["TIB"])
-    f.ds.push(256)
+    f.ds.push(f.mem.cell_get(f.uv["TLEN"]))
 
 def _alias(f):
     pass
@@ -1121,6 +1165,13 @@ def _compile_alias(f, toks, i):
     else:
         alias.body = [["prim", target], ["exit", 0, -1]]
 
+def _next_name(f, toks, i, word):
+    """Return the word-name token at ``i`` or raise a clean error."""
+    if i >= len(toks) or toks[i].kind != "word":
+        raise ForthError(f"{word} without a word name")
+    return toks[i].value.upper()
+
+
 def _variable(f):
     pass
 
@@ -1129,7 +1180,7 @@ def _compile_variable(f, toks, i):
         addr = f.mem.alloc_cell()
         f.current.body.append(["lit", addr])
         return
-    name = toks[i].value.upper()
+    name = _next_name(f, toks, i, "VARIABLE")
     f.compile_state.advance_by = i + 1
     addr = f.mem.alloc_cell()
     e = f.new_secondary(name)
@@ -1141,12 +1192,12 @@ def _constant(f):
 def _compile_constant(f, toks, i):
     nb = f.compile_state.numbuf
     if not nb:
-        raise RuntimeError("CONSTANT without value")
+        raise ForthError("CONSTANT without value")
     value = nb.pop()
     if f.compiling:
         f.current.body.append(["lit", to_cell(value)])
         return
-    name = toks[i].value.upper()
+    name = _next_name(f, toks, i, "CONSTANT")
     f.compile_state.advance_by = i + 1
     e = f.new_secondary(name)
     e.body = [["lit", to_cell(value)], ["exit", 0, -1]]
@@ -1160,7 +1211,7 @@ def _compile_create(f, toks, i):
         f.current.body.append(["lit", addr])
         f.last_word = f.current
         return
-    name = toks[i].value.upper()
+    name = _next_name(f, toks, i, "CREATE")
     f.compile_state.advance_by = i + 1
     addr = f.mem.alloc_cell()
     e = f.new_secondary(name)
@@ -1201,6 +1252,11 @@ def _find_else(f, cells, i, t):
     n = len(cells)
     while j < t and j < n:
         c = cells[j]
+        if c[0] == "ploop":
+            # Constant-step +LOOP acts as a "+LOOP" closer here too.
+            depth -= 1
+            j += 1
+            continue
         if c[0] != "prim":
             j += 1
             continue
@@ -1230,6 +1286,8 @@ def _find_first(f, cells, i, names):
 def _exec_if(f, cells, i):
     flag = f.ds.pop()
     t = f.find_match(cells, i, ("THEN",))
+    if t is None:
+        raise ForthError("IF without matching THEN")
     f.struct_stack.append("if")
     e = _find_else(f, cells, i, t)
     if flag != 0:
@@ -1245,6 +1303,8 @@ def _exec_if(f, cells, i):
 
 def _exec_else(f, cells, i):
     t = f.find_match(cells, i, ("THEN",))
+    if t is None:
+        raise ForthError("ELSE without matching THEN")
     return t + 1
 
 
@@ -1343,9 +1403,14 @@ def _exec_do(f, cells, i):
         if step == 0 and ivalue == nlim:
             f.loops.pop()
             return L + 1
-        f.exec_tokens(cells, i + 1, L)
+        try:
+            f.exec_tokens(cells, i + 1, L)
+        except _LeaveSignal:
+            # LEAVE popped this loop's entry already; unwind to just past
+            # the terminator.
+            return L + 1
         if f.loops and f.loops[-1] is not cur:
-            continue   # inner loop left early (LEAVE / nested DO)
+            continue   # inner loop left early (nested DO)
         cur[0] = ivalue + step
 
 
@@ -1360,7 +1425,10 @@ def _exec_plusloop(f, cells, i):
     f.loops.append([n, nlim])
     while True:
         cur = f.loops[-1]
-        f.exec_tokens(cells, i + 1, L)
+        try:
+            f.exec_tokens(cells, i + 1, L)
+        except _LeaveSignal:
+            return L + 1
         if f.loops and f.loops[-1] is not cur:
             continue
         step = f.ds.pop()
@@ -1384,34 +1452,53 @@ def _exec_leave(f, cells, i):
                      require_depth=False)
     if t is None:
         raise RuntimeError("LEAVE without loop/case")
+    if f.loops:
+        # Only a DO...LOOP is abandoned via the exception (it owns the top of
+        # the loop stack).  A BEGIN...loop is left by merely skipping past its
+        # terminator, which needs no stack cleanup.
+        term = cells[t]
+        if term[0] == "ploop" or term[1] in ("LOOP", "+LOOP"):
+            f.loops.pop()
+            raise _LeaveSignal(t + 1)
     return t + 1
 
 
 def _exec_case(f, cells, i):
+    # record where the CASE selector sits so the matching OF (or ENDCASE in
+    # the fall-through path) can remove exactly it, not whatever the selected
+    # branch happened to push above it.
+    f.case_stack.append(len(f.ds.data) - 1)
     return i + 1
 
 
 def _exec_of(f, cells, i):
     v = f.ds.pop()
-    x = f.ds.peek()
     endof = _find_first(f, cells, i, ("ENDOF",))
     endcase = _find_first(f, cells, i, ("ENDCASE",))
+    ec = endcase if endcase is not None else len(cells)
+    sel_idx = f.case_stack[-1] if f.case_stack else None
+    matched = sel_idx is not None and f.ds.data[sel_idx] == v
     if endof is not None:
-        if x == v:
+        if matched:
             f.exec_tokens(cells, i + 1, endof)
-            ec = endcase if endcase is not None else len(cells)
+            f.ds.data.pop(sel_idx)
+            f.case_stack.pop()
             return ec + 1
         return endof + 1
     else:
         # no ENDOF: body runs up to ENDCASE
-        ec = endcase if endcase is not None else len(cells)
-        if x == v:
+        if matched:
             f.exec_tokens(cells, i + 1, ec)
-            return ec + 1
+            f.ds.data.pop(sel_idx)
+            f.case_stack.pop()
         return ec + 1
 
 
 def _exec_endcase(f, cells, i):
+    # Reached only when no OF matched; remove the leftover CASE selector.
+    if f.case_stack:
+        idx = f.case_stack.pop()
+        del f.ds.data[idx]
     return i + 1
 
 
@@ -1435,7 +1522,7 @@ def _compile_arrays(f, toks, i):
         # Inside a definition the base address is left on the data stack.
         f.current.body.append(["lit", base])
         return
-    name = toks[i].value.upper() if i < len(toks) else None
+    name = toks[i].value.upper() if i < len(toks) and toks[i].kind == "word" else None
     if name:
         f.compile_state.advance_by = i + 1
         entry = f.new_secondary(name)
@@ -1452,7 +1539,7 @@ def _compile_struct(f, toks, i):
     if not nb:
         raise RuntimeError("STRUCT without size")
     n = nb.pop()
-    name = toks[i].value.upper() if i < len(toks) else None
+    name = toks[i].value.upper() if i < len(toks) and toks[i].kind == "word" else None
     if not name:
         raise RuntimeError("STRUCT without name")
     if n < 1:
@@ -1477,7 +1564,7 @@ def _field(f):
 
 def _compile_field(f, toks, i):
     # FIELD NAME : define NAME as the address of the next cell of the struct.
-    name = toks[i].value.upper() if i < len(toks) else ""
+    name = toks[i].value.upper() if i < len(toks) and toks[i].kind == "word" else ""
     if not name:
         raise RuntimeError("FIELD without name")
     info = getattr(f.compile_state, "struct_info", None)

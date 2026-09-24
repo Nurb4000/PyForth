@@ -245,12 +245,19 @@ class TestFixedWords(unittest.TestCase):
         self.assertEqual(run_code('S"nope" NUMBER? . .'), " 0  0 ")
 
     def test_abort_word(self):
-        # The ABORT word used to raise AttributeError (f.control).
-        run_code("1 2 ABORT")
+        # ABORT clears the machine state and raises so the front-end can
+        # report it, but the interpreter remains usable afterwards.
+        with self.assertRaises(ForthError):
+            run_code("1 2 ABORT")
         self.assertEqual(run_code("3 4 + ."), " 7 ")
 
     def test_abort_quote(self):
-        run_code('ABORT" boom"')
+        # ABORT" raises with its text as the message and aborts execution.
+        with self.assertRaises(ForthError):
+            run_code('ABORT" boom"')
+        with self.assertRaises(ForthError) as ctx:
+            run_code('1 2 ABORT" count failed" 99 .')
+        self.assertEqual(str(ctx.exception), " count failed")
         self.assertEqual(run_code("3 4 + ."), " 7 ")
 
     def test_fm_um_return_quotient_and_remainder(self):
@@ -375,6 +382,290 @@ class TestWeb(unittest.TestCase):
     def test_reset_endpoint(self):
         resp = self.client.post("/api/reset")
         self.assertTrue(resp.get_json()["ok"])
+
+
+class TestRegression(unittest.TestCase):
+    """Regression coverage for the interpreter fixes: control flow, error
+    handling, numeric conversion and the compiler/interpret-mode words."""
+
+    # -- LEAVE / DO ... LOOP ------------------------------------------------
+
+    def test_leave_do_loop(self):
+        self.assertEqual(
+            run_code("1 10 DO I . I 3 > IF LEAVE THEN LOOP"), " 1  2  3  4 "
+        )
+
+    def test_leave_nested_do_loop(self):
+        # The inner LEAVE exits only the inner loop; the outer loop runs
+        # to completion with one iteration of the inner loop each time.
+        self.assertEqual(
+            run_code("1 10 DO I . 1 3 DO LEAVE LOOP LOOP"),
+            " 1  2  3  4  5  6  7  8  9 ",
+        )
+
+    def test_leave_in_nested_plusloop(self):
+        self.assertEqual(
+            run_code("0 10 DO I . 2 +LOOP 1 5 DO I . LEAVE LOOP"),
+            " 0  2  4  6  8  1 ",
+        )
+
+    def test_begin_until_loop(self):
+        self.assertEqual(
+            run_code("1 BEGIN DUP . 1+ DUP 5 > UNTIL DROP"), " 1  2  3  4  5 "
+        )
+
+    # -- raw Python exceptions become FORTH errors --------------------------
+
+    def test_ln_domain_raises(self):
+        with self.assertRaises(RuntimeError):
+            run_code("0 LN")
+
+    def test_log_domain_raises(self):
+        with self.assertRaises(RuntimeError):
+            run_code("-1 LOG")
+
+    def test_exp_overflow_raises(self):
+        with self.assertRaises(RuntimeError):
+            run_code("100000 EXP")
+
+    def test_pow_domain_raises(self):
+        # fractional exponents are not reachable from FORTH source (no float
+        # literals), so guard this small fixed case where it is reachable.
+        with self.assertRaises(RuntimeError):
+            run_code("0 -1 **")
+
+    def test_shift_negative_count_raises(self):
+        with self.assertRaises(RuntimeError):
+            run_code("1 -1 LSHIFT")
+        with self.assertRaises(RuntimeError):
+            run_code("1 -1 RSHIFT")
+
+    def test_if_without_then_raises(self):
+        with self.assertRaises(ForthError):
+            run_code(": BAD IF ; BAD")
+
+    def test_else_without_then_raises(self):
+        with self.assertRaises(ForthError):
+            run_code(": BAD ELSE ; BAD")
+
+    def test_colon_missing_name_raises(self):
+        # Do not leave the machine in a half-compiled state.
+        with self.assertRaises(ForthError):
+            run_code(": 5")
+
+    def test_variable_missing_name_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("VARIABLE 5")
+
+    def test_constant_missing_name_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("3 CONSTANT 7")
+
+    def test_create_missing_name_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("CREATE 9")
+
+    def test_plusloop_without_do_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("2 +LOOP")
+
+    # -- execution step budget ----------------------------------------------
+
+    def test_max_steps_raises(self):
+        forth = Forth()
+        forth.max_steps = 50000
+        forth.run(": LOOPIT BEGIN AGAIN ;")
+        with self.assertRaises(ForthError):
+            forth.run("LOOPIT")
+        # the machine stays usable afterwards
+        forth.run("1 2 + .")
+        self.assertEqual(forth.output_text(), " 3 ")
+
+    # -- ? reads the fed input without blocking -----------------------------
+
+    def test_question_non_blocking_input(self):
+        forth = Forth()
+        forth.feed_input("3 4 + .\n")
+        forth.run("?")
+        self.assertEqual(forth.output_text(), " 7 ")
+
+    # -- CASE selector leak --------------------------------------------------
+
+    def test_case_no_selector_leak_matched(self):
+        forth = Forth()
+        forth.run("5 CASE 5 OF S\"five\" ENDOF ENDCASE COUNT TYPE DROP")
+        self.assertEqual(forth.ds.depth(), 0)
+        self.assertEqual(forth.output_text(), "five")
+
+    def test_case_no_selector_leak_unmatched(self):
+        forth = Forth()
+        forth.run("0 CASE 1 OF S\"one\" ENDOF 2 OF S\"two\" ENDOF ENDCASE")
+        self.assertEqual(forth.ds.depth(), 0)
+
+    def test_case_no_selector_leak_default(self):
+        forth = Forth()
+        forth.run("4 CASE 1 OF S\"one\" ENDOF S\"other\" ENDCASE "
+                  "COUNT TYPE DROP")
+        self.assertEqual(forth.ds.depth(), 0)
+        self.assertEqual(forth.output_text(), "other")
+
+    def test_case_compiled(self):
+        forth = Forth()
+        forth.run(": PICKCASE CASE 2 OF S\"two\" ENDOF ENDCASE "
+                  "COUNT TYPE DROP ;")
+        forth.run("2 PICKCASE")
+        self.assertEqual(forth.ds.depth(), 0)
+        self.assertEqual(forth.output_text(), "two")
+        # with a non-matching selector nothing is pushed, so the trailing
+        # COUNT underflows (correctly) and raises a clean FORTH error
+        with self.assertRaises(ForthError):
+            forth.run("1 PICKCASE")
+        self.assertEqual(forth.ds.depth(), 0)
+        self.assertEqual(forth.output_text(), "two")
+
+    # -- ABORT / ABORT" ------------------------------------------------------
+
+    def test_abort_word_recovers(self):
+        forth = Forth()
+        with self.assertRaises(ForthError):
+            forth.run("ABORT")
+        forth.run("1 2 + .")
+        self.assertEqual(forth.output_text(), " 3 ")
+        self.assertEqual(forth.ds.depth(), 0)
+
+    def test_abort_quote_message(self):
+        forth = Forth()
+        with self.assertRaises(ForthError) as cm:
+            forth.run("ABORT\" boom\"")
+        self.assertIn("boom", str(cm.exception))
+
+    # -- counted string writes ----------------------------------------------
+
+    def test_str_bang_keeps_last_char(self):
+        forth = Forth()
+        forth.run('CREATE BUF 20 ALLOT S"abcdefgh" BUF STR! '
+                  "BUF COUNT TYPE")
+        self.assertEqual(forth.output_text(), "abcdefgh")
+
+    def test_chain_writes_full_string(self):
+        forth = Forth()
+        forth.run('CREATE BUF 20 ALLOT BUF S"xyzzy" CHAIN BUF COUNT TYPE')
+        self.assertEqual(forth.output_text(), "xyzzy")
+
+    def test_expect_accept_readline_arg_order(self):
+        forth = Forth()
+        forth.feed_input("hello")
+        forth.run("CREATE BUF 40 ALLOT "
+                  "BUF 5 EXPECT DROP COUNT TYPE ")
+        self.assertEqual(forth.output_text(), "hello")
+        forth.feed_input("abc")
+        forth.run("BUF DUP 5 ACCEPT TYPE ")
+        self.assertEqual(forth.output_text(), "helloabc")
+
+    # -- comparison helpers --------------------------------------------------
+
+    def test_one_less_comparison(self):
+        self.assertEqual(run_code("0 1< ."), " -1 ")
+        self.assertEqual(run_code("1 1< ."), " 0 ")
+
+    def test_two_greater_comparison(self):
+        self.assertEqual(run_code("3 2> ."), " -1 ")
+        self.assertEqual(run_code("0 2> ."), " 0 ")
+
+    def test_lt_dup_only_when_nonzero(self):
+        self.assertEqual(run_code("0 <DUP ."), " 0 ")
+        self.assertEqual(run_code("5 <DUP . ."), " 5  5 ")
+
+    def test_q_dup_only_when_nonzero(self):
+        forth = Forth()
+        forth.run("0 ?DUP")
+        self.assertEqual(forth.ds.depth(), 1)
+        forth = Forth()
+        forth.run("5 ?DUP")
+        self.assertEqual(forth.ds.depth(), 2)
+
+    # -- division semantics --------------------------------------------------
+
+    def test_fdiv_truncates_to_zero(self):
+        self.assertEqual(run_code("-7 3 F/ ."), " -2 ")
+
+    def test_minusdiv_floors(self):
+        self.assertEqual(run_code("-7 3 -/ ."), " -3 ")
+        self.assertEqual(run_code("7 3 -/ ."), " 2 ")
+
+    def test_odd_base_rejected(self):
+        with self.assertRaises(RuntimeError):
+            run_code("1 BASE ! 123 .")
+
+    # -- numeric picture words ----------------------------------------------
+
+    def test_hash_words_build_picture(self):
+        self.assertEqual(run_code("123 #S #> COUNT TYPE"), "123")
+        self.assertEqual(run_code("-45 #S #> COUNT TYPE"), "-45")
+        self.assertEqual(run_code("HEX FF #S #> COUNT TYPE"), "FF")
+        self.assertEqual(run_code("0 #S #> COUNT TYPE"), "0")
+
+    # -- [] / LITERAL interpret regions -------------------------------------
+
+    def test_bracket_literal(self):
+        self.assertEqual(run_code(": X [ 5 ] LITERAL ; X ."), " 5 ")
+
+    def test_plain_literal(self):
+        self.assertEqual(run_code(": X 5 LITERAL ; X ."), " 5 ")
+
+    def test_bracket_region_computes(self):
+        self.assertEqual(run_code(": X [ 2 2 + ] LITERAL ; X ."), " 4 ")
+
+    def test_bracket_at_top_level(self):
+        self.assertEqual(run_code("1 [ 2 ] + ."), " 3 ")
+
+    # -- POSTPONE / ['] / EXECUTE --------------------------------------------
+
+    def test_postpone_secondary(self):
+        self.assertEqual(run_code(": X 5 ; : Y POSTPONE X ; Y ."), " 5 ")
+
+    def test_postpone_primitive(self):
+        self.assertEqual(run_code(": DUP2 POSTPONE DUP ; 7 DUP2 . ."),
+                         " 7  7 ")
+
+    def test_lit_tick_and_execute(self):
+        self.assertEqual(run_code(": SQ DUP * ; 7 ['] SQ EXECUTE ."), " 49 ")
+        self.assertEqual(run_code("7 ['] DUP EXECUTE . ."), " 7  7 ")
+
+    # -- STATE / SOURCE / WORD / BL ------------------------------------------
+
+    def test_state_word(self):
+        self.assertEqual(run_code("STATE @ ."), " 0 ")
+        self.assertEqual(run_code(": S STATE @ ; S ."), " 0 ")
+
+    def test_source_word(self):
+        forth = Forth()
+        forth.run("SOURCE SWAP DROP .")
+        self.assertEqual(forth.output_text(), " 18 ")
+
+    def test_word_parses_source(self):
+        forth = Forth()
+        forth.run("BL WORD COUNT TYPE BL WORD COUNT TYPE")
+        self.assertEqual(forth.output_text(), "BLWORD")
+
+    def test_word_advances_in(self):
+        forth = Forth()
+        forth.run("BL WORD DROP >IN @ .")
+        self.assertTrue(forth.output_text().strip().isnumeric())
+
+    def test_bl_word(self):
+        self.assertEqual(run_code("BL ."), " 32 ")
+
+    # -- invalid-program recovery across a whole file ------------------------
+
+    def test_error_does_not_corrupt_dictionary(self):
+        forth = Forth()
+        forth.run(": GOOD 5 ;")
+        forth.run(": DIVZ 1 0 / ;")
+        with self.assertRaises(RuntimeError):
+            forth.run("DIVZ")
+        forth.run("GOOD .")
+        self.assertEqual(forth.output_text(), " 5 ")
 
 
 if __name__ == "__main__":

@@ -341,6 +341,7 @@ class Forth:
         self.while_stack = []     # flags for BEGIN/WHILE/THEN loops
         self.begin_stack = []     # indices of open BEGINs
         self.struct_stack = []    # stack of 'if'/'begin' markers for THEN
+        self.case_stack = []      # selector positions of open CASE constructs
         self.compiling = False
         self.current = None
         self.last_word = None     # most recently defined word (for IMMEDIATE)
@@ -355,14 +356,18 @@ class Forth:
         # input buffering for KEY / EXPECT
         self.input_buffer = ""
         self.input_index = 0
+        # execution step budget (default None = unlimited; the web front-end
+        # sets a cap so a runaway loop cannot peg a worker)
+        self.steps = 0
+        self.max_steps = None
         self._setup_user_vars()
         self._register_core()
 
     def _setup_user_vars(self):
         # cell-sized user variables
-        for name in (">IN", "BLK", "SPAN", "BASE"):
+        for name in (">IN", "BLK", "SPAN", "BASE", "TLEN"):
             self.uv[name] = self.mem.alloc_cell()
-            self.mem.cell_set(self.uv[name], self.user[name])
+            self.mem.cell_set(self.uv[name], self.user.get(name, 0))
         # char-buffer sized regions
         self.uv["TIB"] = self.mem.alloc_string(256)
         self.uv["PAD"] = self.mem.alloc_string(256)
@@ -494,8 +499,23 @@ class Forth:
 
     # -- top-level interpret / run -----------------------------------------
 
+    def _set_source(self, text):
+        """Record the current input text in the TIB so that SOURCE / WORD /
+        >IN behave.  The text is truncated to the TIB size."""
+        raw = text.encode("utf-8", "replace")
+        tib = self.uv["TIB"]
+        limit = 256
+        if len(raw) > limit:
+            raw = raw[:limit]
+        for idx, b in enumerate(raw):
+            self.mem.cset(tib + idx, b & 0xFF)
+        self.mem.cell_set(self.uv["TLEN"], len(raw))
+        self.mem.cell_set(self.uv[">IN"], 0)
+
     def interpret(self, line):
         """Interpret a single line in interpret mode."""
+        self.steps = 0
+        self._set_source(line)
         toks = self.tokenize(line)
         self._process(toks)
 
@@ -510,6 +530,8 @@ class Forth:
         all_toks = []
         for line in text.splitlines():
             all_toks.extend(self.tokenize(line))
+        self.steps = 0
+        self._set_source(text)
         self._process(all_toks)
 
     def abort(self):
@@ -521,6 +543,7 @@ class Forth:
         self.while_stack.clear()
         self.begin_stack.clear()
         self.struct_stack.clear()
+        self.case_stack.clear()
         self.compiling = False
         self.current = None
         self._pending_does = None
@@ -533,6 +556,12 @@ class Forth:
         n = len(toks)
         i = 0
         temp = []                 # cells for the current interpret-mode context
+
+        def in_body():
+            """True when the current token must go into the definition being
+            compiled: we are compiling *and* not inside a ``[ ... ]`` region."""
+            return self.compiling and not cs.interpret_mode
+
         while i < n:
             t = toks[i]
             i += 1
@@ -548,7 +577,7 @@ class Forth:
                 continue
             if k == "dotstr":
                 # ." text" compiles/executes as: push the string, print it.
-                dest = self.current.body if self.compiling else temp
+                dest = self.current.body if in_body() else temp
                 self._flush(dest)
                 dest.append(["lit", self._make_static_string(t.value)])
                 dest.append(["prim", "S."])
@@ -557,18 +586,17 @@ class Forth:
                 # .( text) behaves like ." here: the text is compiled/executed
                 # as "push the string, print it", so it stays in line with the
                 # surrounding words (e.g. ``CR .( hi)`` prints hi after the CR).
-                dest = self.current.body if self.compiling else temp
+                dest = self.current.body if in_body() else temp
                 self._flush(dest)
                 dest.append(["lit", self._make_static_string(t.value)])
                 dest.append(["prim", "S."])
                 continue
             if k == "abortstr":
                 # ABORT" text" compiles/executes as: push the string, abort.
-                dest = self.current.body if self.compiling else temp
+                dest = self.current.body if in_body() else temp
                 self._flush(dest)
                 dest.append(["lit", self._make_static_string(t.value)])
-                dest.append(["prim", "STR@"])
-                dest.append(["prim", "ABORT"])
+                dest.append(["prim", "ABORT\""])
                 continue
 
             name = t.value.upper()
@@ -583,20 +611,34 @@ class Forth:
             if name == ":":
                 if self.compiling:
                     raise ForthError("nested ':'")
+                if i >= n or toks[i].kind != "word":
+                    raise ForthError("':' missing a word name")
                 self.start_compile(toks[i].value)
                 i += 1
                 continue
             if name == "]":
+                # ] switches from an interpret region back to compiling.
+                # The cells accumulated for the region are run *now* so that
+                # values pushed there (e.g. by ``[ 5 ]``) are available to an
+                # immediate word such as LITERAL that follows on the same line.
+                self._flush(temp)
+                if temp:
+                    self.exec_tokens(temp, 0, len(temp))
+                    temp = []
                 cs.interpret_mode = False
                 continue
             if name == "[":
+                # [ pauses compilation: the next tokens are interpreted (they
+                # go into ``temp``) until a matching ] is seen.
+                dest = self.current.body if in_body() else temp
+                self._flush(dest)
                 cs.interpret_mode = True
                 continue
 
             if name == "CHAR":
                 # CHAR consumes the following token as a single character.  It
                 # needs lookahead, so handle it here rather than at runtime.
-                dest = self.current.body if self.compiling else temp
+                dest = self.current.body if in_body() else temp
                 if i < n and toks[i].kind in ("word", "num", "str"):
                     value = str(toks[i].value or "")
                     ch = value[0] if value else " "
@@ -605,6 +647,23 @@ class Forth:
                     ch = " "
                 self._flush(dest)
                 dest.append(["lit", to_cell(ord(ch))])
+                continue
+            if name == "[']":
+                # ['] NAME : push the entry address of NAME (for EXECUTE).  The
+                # lookahead means this works both while compiling and directly
+                # in interpret mode.
+                if i < n and toks[i].kind == "word":
+                    target = toks[i].value.upper()
+                    i += 1
+                else:
+                    raise ForthError("['] missing a word name")
+                entry = self.find(target)
+                if entry is None:
+                    raise ForthError(f"?NAME? {target}")
+                self.exec_map[id(entry)] = entry
+                dest = self.current.body if in_body() else temp
+                self._flush(dest)
+                dest.append(["lit", id(entry)])
                 continue
 
             entry = self.find(name)
@@ -618,7 +677,7 @@ class Forth:
                 if val is not None:
                     cs.numbuf.append(val)
                     continue
-                (self.current.body if self.compiling else temp).append(
+                (self.current.body if in_body() else temp).append(
                     ["litnum", t.value])
                 continue
             p = entry.primary
@@ -648,10 +707,10 @@ class Forth:
             if name == "+LOOP" and cs.numbuf:
                 # A number immediately preceding +LOOP is its constant step.
                 step = cs.numbuf.pop()
-                dest = self.current.body if self.compiling else temp
+                dest = self.current.body if in_body() else temp
                 dest.append(["ploop", to_cell(step)])
                 continue
-            dest = self.current.body if self.compiling else temp
+            dest = self.current.body if in_body() else temp
             self._flush(dest)
             if entry.body is not None:
                 dest.append(["sec", name])
@@ -727,6 +786,10 @@ class Forth:
         if end is None:
             end = len(cells)
         while i < end:
+            if self.max_steps is not None:
+                self.steps += 1
+                if self.steps > self.max_steps:
+                    raise ForthError("execution step limit exceeded")
             c = cells[i]
             tag = c[0]
             if tag == "lit":
@@ -743,6 +806,8 @@ class Forth:
                 i += 1
             elif tag == "exit":
                 return i
+            elif tag == "ploop":
+                raise ForthError("+LOOP without DO")
             else:  # prim
                 name = c[1]
                 entry = self.find(name)
@@ -777,7 +842,16 @@ class Forth:
             c = cells[j]
             tag = c[0]
             if tag == "ploop":
-                return j
+                if not require_depth:
+                    return j
+                # A constant-step +LOOP acts as a "+LOOP" closer and must be
+                # counted at the proper nesting depth so an inner loop's
+                # terminator does not hijack an outer DO/IF scan.
+                depth -= 1
+                if depth == 0 and "+LOOP" in closer_names:
+                    return j
+                j += 1
+                continue
             if tag != "prim":
                 j += 1
                 continue

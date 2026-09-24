@@ -17,14 +17,14 @@ even when no source files are given.
 import select
 import sys
 
-from .machine import Forth, ForthError
+from .machine import Forth
 
 
 PROMPT = "ok> "
 CONT_PROMPT = "...> "
 WELCOME = (
     "PyForth - a FORTH interpreter.  Type 'bye' to exit, "
-    "'\\\"include file.fs\\\"' to load a file."
+    "or type \"include file.fs\" (with the quotes) to load a file."
 )
 
 
@@ -66,7 +66,7 @@ def _run_source(forth, path, out):
     forth.clear_output()
     try:
         forth.run(source)
-    except (ForthError, RuntimeError) as error:
+    except Exception as error:
         _write(out, "{}\n".format(error))
         forth.abort()
         _write(out, " ok\n")
@@ -100,6 +100,9 @@ def repl(forth, infile=None, outfile=None):
         except EOFError:
             _write(out, "")
             break
+        except KeyboardInterrupt:
+            _write(out, "^C")
+            continue
         stripped = line.strip()
         if stripped.lower() in ("bye", "quit"):
             break
@@ -115,7 +118,7 @@ def repl(forth, infile=None, outfile=None):
         forth.clear_output()
         try:
             forth.interpret(line)
-        except (ForthError, RuntimeError) as error:
+        except Exception as error:
             _write(out, "{}\n".format(error))
             forth.abort()
             _write(out, "ok")
@@ -141,10 +144,12 @@ def main(argv=None):
     files = [arg for arg in argv if arg not in ("-i", "--interactive", "-b", "--batch")]
 
     forth = Forth()
+    failed = False
     for path in files:
-        _run_source(forth, path, sys.stdout)
+        if not _run_source(forth, path, sys.stdout):
+            failed = True
     if batch:
-        return 0
+        return 1 if failed else 0
 
     repl(forth)
     return 0

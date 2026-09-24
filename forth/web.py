@@ -36,7 +36,7 @@ from flask import (
     session,
 )
 
-from .machine import Forth, ForthError
+from .machine import Forth
 
 
 def _new_app():
@@ -57,6 +57,8 @@ def _new_app():
             instances.pop(next(iter(instances)))
         if token not in instances:
             instances[token] = Forth()
+            # Bound the per-request cost so a runaway loop cannot pin a worker.
+            instances[token].max_steps = 10_000_000
         return instances[token]
 
     @app.route("/")
@@ -73,7 +75,7 @@ def _new_app():
         forth.feed_input(code + "\n")
         try:
             forth.run(code)
-        except (ForthError, RuntimeError) as error:
+        except Exception as error:
             forth.abort()
             text = forth.output_text()
             forth.clear_output()
