@@ -808,6 +808,30 @@ class TestRegression(unittest.TestCase):
         self.assertEqual(run_code(code + " 5 F ."), " 120 ")
         self.assertEqual(run_code(code + " 1 F ."), " 1 ")
 
+    # -- batch 2: U. / [CHAR] / TIB / PAD / MOVE / /STRING ----------------
+
+    def test_u_dot(self):
+        self.assertEqual(run_code("-5 U."), " 5 ")
+        self.assertEqual(run_code("5 U."), " 5 ")
+
+    def test_bracket_char(self):
+        self.assertEqual(run_code("[CHAR] X EMIT"), "X")
+        self.assertEqual(run_code(": A [CHAR] X EMIT ; A"), "X")
+
+    def test_tib_pad_addresses(self):
+        forth = Forth()
+        forth.run("TIB PAD")
+        self.assertEqual(forth.ds.data, [forth.uv["TIB"], forth.uv["PAD"]])
+
+    def test_move_cells(self):
+        self.assertEqual(run_code("65 100 C! 66 101 C! 100 200 2 MOVE "
+                                  "200 C@ . 201 C@ ."), " 65  66 ")
+
+    def test_slash_string(self):
+        forth = Forth()
+        forth.run('S" abcABCD" COUNT 3 /STRING 4 = .')
+        self.assertEqual(forth.output_text(), " -1 ")
+
     # -- invalid-program recovery across a whole file ------------------------
 
     def test_error_does_not_corrupt_dictionary(self):

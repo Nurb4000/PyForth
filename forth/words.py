@@ -63,6 +63,11 @@ def _pad(f):
     return f.uv["PAD"]
 
 
+def _pad_word(f):
+    # ( -- addr ) address of the scratch area used by pictured output
+    f.ds.push(f.uv["PAD"])
+
+
 # ---------------------------------------------------------------------------
 # Register everything
 # ---------------------------------------------------------------------------
@@ -280,6 +285,8 @@ def register_words(f):
     add("C,", P(_c_comma))
     add("CMOVE", P(_cmove))
     add("CMOVE>", P(_cmove_up))
+    add("MOVE", P(_move))
+    add("/STRING", P(_slash_string))
     add("FILL", P(_fill))
     add("ERASE", P(_erase))
     add("BLANK", P(_blank))
@@ -297,6 +304,8 @@ def register_words(f):
     add("BASE", P(lambda f: f.ds.push(f.uv["BASE"])))
     add(">IN", P(lambda f: f.ds.push(f.uv[">IN"])))
     add("SPAN", P(lambda f: f.ds.push(f.uv["SPAN"])))
+    add("TIB", P(lambda f: f.ds.push(f.uv["TIB"])))
+    add("PAD", P(_pad_word))
 
     # =======================================================================
     # Number base handling
@@ -324,6 +333,7 @@ def register_words(f):
     # Basic I/O
     # =======================================================================
     add(".", P(_dot))
+    add("U.", P(_u_dot))
     add("?.", P(_qdot))
     add("S.", P(_s_dot))
     add(".R", P(_dot_r))
@@ -906,6 +916,26 @@ def _cmove_up(f):
         cset(dst + j, cget(src + j))
 
 
+def _move(f):
+    # ( addr1 addr2 u -- ) copy u cells; cells and bytes share one address
+    # space here, so forward/backward handling matters for overlap.
+    u = f.ds.pop(); dst = f.ds.pop(); src = f.ds.pop()
+    cget = f.mem.cget; cset = f.mem.cset
+    if dst <= src:
+        for j in range(u):
+            cset(dst + j, cget(src + j))
+    else:
+        for j in range(u - 1, -1, -1):
+            cset(dst + j, cget(src + j))
+
+
+def _slash_string(f):
+    # ( addr u n -- addr+n u-n ) offset a described string by n characters
+    n = f.ds.pop(); u = f.ds.pop(); a = f.ds.pop()
+    f.ds.push(a + n)
+    f.ds.push(u - n)
+
+
 def _fill(f):
     # ( addr u char -- ) store char in u bytes starting at addr
     ch = f.ds.pop() & 0xFF
@@ -1039,6 +1069,11 @@ def _dot(f):
 
 def _qdot(f):
     n = f.ds.pop()
+    base = f.mem.cell_get(f.uv["BASE"])
+    f.emit(" " + _number_to_str(f, n, base) + " ")
+
+def _u_dot(f):
+    n = abs(f.ds.pop())
     base = f.mem.cell_get(f.uv["BASE"])
     f.emit(" " + _number_to_str(f, n, base) + " ")
 

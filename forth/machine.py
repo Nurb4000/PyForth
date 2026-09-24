@@ -642,9 +642,10 @@ class Forth:
                 cs.interpret_mode = True
                 continue
 
-            if name == "CHAR":
-                # CHAR consumes the following token as a single character.  It
-                # needs lookahead, so handle it here rather than at runtime.
+            if name in ("CHAR", "[CHAR]"):
+                # CHAR / [CHAR] consume the following token as a single
+                # character.  They need lookahead, so handle them here rather
+                # than at runtime.
                 dest = self.current.body if in_body() else temp
                 if i < n and toks[i].kind in ("word", "num", "str"):
                     value = str(toks[i].value or "")
