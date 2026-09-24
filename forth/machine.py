@@ -665,6 +665,23 @@ class Forth:
                 self._flush(dest)
                 dest.append(["lit", id(entry)])
                 continue
+            if name == "INCLUDE":
+                # INCLUDE file : load the file's source right where it
+                # appears (macro-style), so later words on the same line can
+                # use the definitions it provides.
+                if i < n and toks[i].kind == "word":
+                    path = toks[i].value
+                    i += 1
+                else:
+                    raise ForthError("INCLUDE missing a filename")
+                try:
+                    with open(path, "r") as handle:
+                        source = handle.read()
+                except OSError as error:
+                    raise ForthError(
+                        f"cannot include {path}: {error}") from None
+                self.run(source)
+                continue
 
             entry = self.find(name)
             if entry is None:

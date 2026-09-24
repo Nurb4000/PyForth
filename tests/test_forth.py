@@ -656,6 +656,58 @@ class TestRegression(unittest.TestCase):
     def test_bl_word(self):
         self.assertEqual(run_code("BL ."), " 32 ")
 
+    # -- missing-feature batch: HERE , C, 2@ 2! WORDS INCLUDE ----------------
+
+    def test_here_returns_free_cell(self):
+        f = Forth()
+        f.run("HERE .")
+        here = int(f.output_text().split()[0])
+        self.assertGreater(here, 0)
+        f.run("1 ALLOT")
+        self.assertEqual(f.ds.depth(), 0)
+        self.assertEqual(f.mem.next_cell_addr, here + 1)
+
+    def test_comma_stores_cell(self):
+        forth = Forth()
+        forth.run("HERE 42 , HERE 1- @ .")
+        self.assertEqual(forth.output_text(), " 42 ")
+
+    def test_c_comma_stores_byte(self):
+        forth = Forth()
+        forth.run("HERE 65 C, HERE 1- C@ .")
+        self.assertEqual(forth.output_text(), " 65 ")
+
+    def test_two_fetch_and_store(self):
+        self.assertEqual(run_code("1 2 HERE 2! HERE 2@ . ."), " 2  1 ")
+        self.assertEqual(run_code("1 2 HERE 2! HERE 2@ + ."), " 3 ")
+
+    def test_words_lists_dictionary(self):
+        forth = Forth()
+        forth.run(": FOO 10 ;")
+        forth.run("WORDS")
+        names = forth.output_text().split()
+        self.assertIn("DUP", names)
+        self.assertIn("HERE", names)
+        self.assertIn("FOO", names)
+        self.assertIn("INCLUDE", names)
+
+    def test_include_loads_file(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".fs", delete=False) as handle:
+            handle.write(": SQU 4 ;")
+            path = handle.name
+        try:
+            forth = Forth()
+            forth.run("INCLUDE {} SQU .".format(path))
+            self.assertEqual(forth.output_text(), " 4 ")
+        finally:
+            os.unlink(path)
+
+    def test_include_missing_file_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("INCLUDE this_file_does_not_exist.fs")
+
     # -- invalid-program recovery across a whole file ------------------------
 
     def test_error_does_not_corrupt_dictionary(self):

@@ -226,11 +226,16 @@ def register_words(f):
     add("@", P(_at))
     add("!", P(_bang))
     add("+!", P(_plusbang))
+    add("2@", P(_at_two))
+    add("2!", P(_bang_two))
     add("@+", P(_atplus))
     add("@-", P(_atminus))
     add("C@", P(_c_at))
     add("C!", P(_c_bang))
     add("CHAIN", P(_chain))
+    add("HERE", P(_here))
+    add(",", P(_comma))
+    add("C,", P(_c_comma))
 
     # =======================================================================
     # Data stack info words
@@ -309,6 +314,8 @@ def register_words(f):
     add("?", P(_question))
     add("WORD", P(_word))
     add("INTERPRET", P(_interpret))
+    add("INCLUDE", P(_include))
+    add("WORDS", P(_words))
     add("SOURCE", P(_source))
 
     # =======================================================================
@@ -740,6 +747,42 @@ def _chain(f):
         f.mem.cset(a + j, f.mem.cget(b + j))
 
 
+def _at_two(f):
+    # ( a-addr -- x1 x2 ) load two consecutive cells (lower address first)
+    a = f.ds.pop()
+    f.ds.push(f.mem.cell_get(a))
+    f.ds.push(f.mem.cell_get(a + 1))
+
+
+def _bang_two(f):
+    # ( x1 x2 a-addr -- ) store two consecutive cells (x1 at a-addr)
+    a = f.ds.pop()
+    x2 = f.ds.pop(); x1 = f.ds.pop()
+    f.mem.cell_set(a, x1)
+    f.mem.cell_set(a + 1, x2)
+
+
+def _here(f):
+    # ( -- addr ) address of the next free data-space cell
+    f.ds.push(f.mem.next_cell_addr)
+
+
+def _comma(f):
+    # ( x -- ) store x at HERE and advance HERE by one cell
+    x = f.ds.pop()
+    a = f.mem.next_cell_addr
+    f.mem.cell_set(a, x)
+    f.mem.next_cell_addr += 1
+
+
+def _c_comma(f):
+    # ( char -- ) store char at HERE and advance HERE by one cell
+    x = f.ds.pop()
+    a = f.mem.next_cell_addr
+    f.mem.cset(a, x)
+    f.mem.next_cell_addr += 1
+
+
 # ---------------------------------------------------------------------------
 # Stack pointer words
 # ---------------------------------------------------------------------------
@@ -1136,6 +1179,25 @@ def _source(f):
     # ( -- c-addr u ) address and length of the current input buffer (TIB)
     f.ds.push(f.uv["TIB"])
     f.ds.push(f.mem.cell_get(f.uv["TLEN"]))
+
+
+def _words(f):
+    # ( -- ) list the dictionary, wrapped at ~80 columns
+    names = sorted(f.dict.keys())
+    col = 0
+    for name in names:
+        if col and col + 1 + len(name) > 80:
+            f.emit("\n")
+            col = 0
+        if col:
+            f.emit(" ")
+            col += 1
+        f.emit(name)
+        col += len(name)
+
+
+def _include(f):
+    raise RuntimeError("INCLUDE must be followed by a filename")
 
 def _alias(f):
     pass
