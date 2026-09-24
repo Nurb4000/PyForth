@@ -829,7 +829,7 @@ class TestRegression(unittest.TestCase):
 
     def test_slash_string(self):
         forth = Forth()
-        forth.run('S" abcABCD" COUNT 3 /STRING 4 = .')
+        forth.run('S" abcABCD" COUNT 4 /STRING 4 = .')
         self.assertEqual(forth.output_text(), " -1 ")
 
     # -- invalid-program recovery across a whole file ------------------------
