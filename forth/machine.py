@@ -179,12 +179,14 @@ class Tokenizer:
                 continue
             if c == "S" and i + 1 < n and line[i + 1] == '"':
                 i += 2  # skip opening S"
-                content, i = self._read_string(line, i, n)
+                content, i = self._read_string(
+                    line, self._after_string_delim(line, i, n), n)
                 toks.append(Tok("str", content))
                 continue
             if c == "." and i + 1 < n and line[i + 1] == '"':
                 i += 2  # skip opening ."  (immediate string, printed at runtime)
-                content, i = self._read_string(line, i, n)
+                content, i = self._read_string(
+                    line, self._after_string_delim(line, i, n), n)
                 toks.append(Tok("dotstr", content))
                 continue
             if c == "." and i + 1 < n and line[i + 1] == "(":
@@ -192,19 +194,22 @@ class Tokenizer:
                 close = line.find(")", i + 2)
                 if close == -1:
                     close = n
-                content = line[i + 2:close]
+                start = self._after_string_delim(line, i + 2, n)
+                content = line[start:close]
                 toks.append(Tok("parenstr", content))
                 i = close + 1
                 continue
             if line[i:i + 5].upper() == "ABORT" and i + 5 < n \
                     and line[i + 5] == '"':
                 i += 6  # skip ABORT"
-                content, i = self._read_string(line, i, n)
+                content, i = self._read_string(
+                    line, self._after_string_delim(line, i, n), n)
                 toks.append(Tok("abortstr", content))
                 continue
             if c == '"':
                 i += 1  # skip opening quote
-                content, i = self._read_string(line, i, n)
+                content, i = self._read_string(
+                    line, self._after_string_delim(line, i, n), n)
                 toks.append(Tok("str", content))
                 continue
             # Read a maximal run of non-separator characters as one token.
@@ -238,6 +243,14 @@ class Tokenizer:
                 i += 1
         i += 1  # skip closing quote
         return "".join(buf), i
+
+    def _after_string_delim(self, line, i, n):
+        """Skip the single delimiter that separates a `...`\" opening (S\", .\",
+        ABORT\", or plain ") from the string text, gforth-style, so that
+        ``S" hello"`` yields ``hello`` instead of ``" hello"``."""
+        if i < n and line[i] in " \t\r\n":
+            return i + 1
+        return i
 
     def _classify(self, word):
         up = word.upper()

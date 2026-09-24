@@ -169,7 +169,7 @@ class TestStrings(unittest.TestCase):
     def test_escaped_quote(self):
         self.assertEqual(
             run_code(r'S" he said \"hi\"" COUNT TYPE'),
-            ' he said "hi"',
+            'he said "hi"',
         )
 
 
@@ -218,16 +218,16 @@ class TestFixedWords(unittest.TestCase):
         self.assertEqual(run_code("1 2 3 -ROT . . ."), " 2  1  3 ")
 
     def test_dot_quote(self):
-        # A single space after ." is a separator (kept, matching S").
-        self.assertEqual(run_code('." hi there"'), " hi there")
-        self.assertEqual(run_code(': X ." hello world" ; X'), " hello world")
+        # A single space after ." is the delimiter (skipped, gforth-style).
+        self.assertEqual(run_code('." hi there"'), "hi there")
+        self.assertEqual(run_code(': X ." hello world" ; X'), "hello world")
 
     def test_immediate_paren_string(self):
         # .( text) prints its text and must not touch the data stack.
-        self.assertEqual(run_code("CR .( Hello, World!)"), "\n Hello, World!")
-        self.assertEqual(run_code("1 .( x) ."), " x 1 ")
+        self.assertEqual(run_code("CR .( Hello, World!)"), "\nHello, World!")
+        self.assertEqual(run_code("1 .( x) ."), "x 1 ")
         # Like .", the print is deferred until the compiled word runs.
-        self.assertEqual(run_code(": SAY .( hi now) ; SAY"), " hi now")
+        self.assertEqual(run_code(": SAY .( hi now) ; SAY"), "hi now")
         self.assertEqual(run_code(": SAY .( hi now) ;"), "")
 
     def test_alias(self):
@@ -257,7 +257,7 @@ class TestFixedWords(unittest.TestCase):
             run_code('ABORT" boom"')
         with self.assertRaises(ForthError) as ctx:
             run_code('1 2 ABORT" count failed" 99 .')
-        self.assertEqual(str(ctx.exception), " count failed")
+        self.assertEqual(str(ctx.exception), "count failed")
         self.assertEqual(run_code("3 4 + ."), " 7 ")
 
     def test_fm_um_return_quotient_and_remainder(self):
@@ -273,7 +273,7 @@ class TestFixedWords(unittest.TestCase):
 
     def test_endof_and_undo_no_crash(self):
         self.assertEqual(
-            run_code('1 CASE 1 OF ." one" ENDOF ENDCASE'), " one"
+            run_code('1 CASE 1 OF ." one" ENDOF ENDCASE'), "one"
         )
 
 
@@ -829,7 +829,7 @@ class TestRegression(unittest.TestCase):
 
     def test_slash_string(self):
         forth = Forth()
-        forth.run('S" abcABCD" COUNT 4 /STRING 4 = .')
+        forth.run('S" abcABCD" COUNT 3 /STRING 4 = .')
         self.assertEqual(forth.output_text(), " -1 ")
 
     # -- invalid-program recovery across a whole file ------------------------
