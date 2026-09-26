@@ -301,9 +301,21 @@ def register_words(f):
     add("SP@", P(lambda f: f.ds.push(f.sp_addr)))
     add("SP!", P(_sp_store))
     add("RS@", P(lambda f: f.ds.push(f.rs_addr)))
-    add("BASE", P(lambda f: f.ds.push(f.uv["BASE"])))
-    add(">IN", P(lambda f: f.ds.push(f.uv[">IN"])))
-    add("SPAN", P(lambda f: f.ds.push(f.uv["SPAN"])))
+    # ANS FORTH: BASE / >IN / SPAN / BLK leave the current *value* of the
+    # system variable.  The address variants (BASE@, >IN!, ...) are provided
+    # for the less common "poke the raw cell" idiom.
+    add("BASE", P(lambda f: f.ds.push(f.mem.cell_get(f.uv["BASE"]))))
+    add("BASE@", P(lambda f: f.ds.push(f.uv["BASE"])))
+    add("BASE!", P(lambda f: f.mem.cell_set(f.uv["BASE"], f.ds.pop())))
+    add(">IN", P(lambda f: f.ds.push(f.mem.cell_get(f.uv[">IN"]))))
+    add(">IN@", P(lambda f: f.ds.push(f.uv[">IN"])))
+    add(">IN!", P(lambda f: f.mem.cell_set(f.uv[">IN"], f.ds.pop())))
+    add("SPAN", P(lambda f: f.ds.push(f.mem.cell_get(f.uv["SPAN"]))))
+    add("SPAN@", P(lambda f: f.ds.push(f.uv["SPAN"])))
+    add("SPAN!", P(lambda f: f.mem.cell_set(f.uv["SPAN"], f.ds.pop())))
+    add("BLK", P(lambda f: f.ds.push(f.mem.cell_get(f.uv["BLK"]))))
+    add("BLK@", P(lambda f: f.ds.push(f.uv["BLK"])))
+    add("BLK!", P(lambda f: f.mem.cell_set(f.uv["BLK"], f.ds.pop())))
     add("TIB", P(lambda f: f.ds.push(f.uv["TIB"])))
     add("PAD", P(_pad_word))
 

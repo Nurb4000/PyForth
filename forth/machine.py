@@ -686,6 +686,23 @@ class Forth:
                 self._flush(dest)
                 dest.append(["lit", id(entry)])
                 continue
+            if name == "'":
+                # ' NAME : push the execution token of NAME (for EXECUTE).  The
+                # lookahead means this works both while compiling and directly
+                # in interpret mode, exactly like ['] but without the bracket.
+                if i < n and toks[i].kind == "word":
+                    target = toks[i].value.upper()
+                    i += 1
+                else:
+                    raise ForthError("' missing a word name")
+                entry = self.find(target)
+                if entry is None:
+                    raise ForthError(f"?NAME? {target}")
+                self.exec_map[id(entry)] = entry
+                dest = self.current.body if in_body() else temp
+                self._flush(dest)
+                dest.append(["lit", id(entry)])
+                continue
             if name == "INCLUDE":
                 # INCLUDE file : load the file's source right where it
                 # appears (macro-style), so later words on the same line can

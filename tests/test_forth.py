@@ -98,6 +98,26 @@ class TestBases(unittest.TestCase):
         self.assertEqual(run_code("16#1F ."), " 31 ")
         self.assertEqual(run_code("8#17 ."), " 15 ")
 
+    def test_base_returns_value_not_address(self):
+        # BASE ( -- n ) must push the current base value, not the address of
+        # the system variable (a long-standing source of confusion).  We
+        # compare against a literal rather than printing, since '.' renders
+        # in the current base.
+        self.assertEqual(run_code("BASE ."), " 10 ")
+        # '16' is tokenized eagerly in decimal, so it stays sixteen; HEX
+        # selects base 16, so BASE must report sixteen (not an address).
+        self.assertEqual(run_code("HEX BASE 16 = ."), " -1 ")
+        self.assertEqual(run_code("BASE BASE@ <> ."), " -1 ")  # value != address
+
+    def test_system_variable_values(self):
+        # >IN / SPAN / BLK all report their current value.
+        self.assertEqual(run_code(">IN ."), " 0 ")
+        self.assertEqual(run_code("SPAN ."), " 0 ")
+        self.assertEqual(run_code("BLK ."), " 0 ")
+        forth = Forth()
+        forth.run("123 >IN! >IN .")
+        self.assertEqual(forth.output_text().strip(), "123")
+
 
 class TestControlStructures(unittest.TestCase):
     def test_do_loop(self):
@@ -595,7 +615,7 @@ class TestRegression(unittest.TestCase):
 
     def test_odd_base_rejected(self):
         with self.assertRaises(RuntimeError):
-            run_code("1 BASE ! 123 .")
+            run_code("1 BASE! 123 .")
 
     # -- numeric picture words ----------------------------------------------
 
@@ -632,6 +652,15 @@ class TestRegression(unittest.TestCase):
         self.assertEqual(run_code(": SQ DUP * ; 7 ['] SQ EXECUTE ."), " 49 ")
         self.assertEqual(run_code("7 ['] DUP EXECUTE . ."), " 7  7 ")
 
+    def test_tick_word(self):
+        # ' NAME ( -- xt ) must push the execution token of NAME.
+        self.assertEqual(
+            run_code(": FOO 99 ; FOO ' FOO EXECUTE ."), " 99 "
+        )
+        self.assertEqual(
+            run_code(": FOO 7 ; : G ' FOO EXECUTE ; G ."), " 7 "
+        )
+
     # -- STATE / SOURCE / WORD / BL ------------------------------------------
 
     def test_state_word(self):
@@ -650,7 +679,7 @@ class TestRegression(unittest.TestCase):
 
     def test_word_advances_in(self):
         forth = Forth()
-        forth.run("BL WORD DROP >IN @ .")
+        forth.run("BL WORD DROP >IN .")
         self.assertTrue(forth.output_text().strip().isnumeric())
 
     def test_bl_word(self):

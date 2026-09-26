@@ -136,7 +136,7 @@ words to explore. Categories include:
 - **Memory**: `@` `!` `+!` `@+` `@-` `C@` `C!` `CHAIN` `SP@` `SP!` `RS@`.
 - **Control**: `IF`/`ELSE`/`THEN`, `DO`/`+LOOP`/`?DO`/`LOOP`/`UNDO`,
   `BEGIN`/`WHILE`/`REPEAT`/`UNTIL`/`AGAIN`, `CASE`/`OF`/`ENDOF`/`ENDCASE`,
-  `LEAVE`, and recursion by direct self-reference.
+  `LEAVE`, `'` (tick, for `EXECUTE`), and recursion by direct self-reference.
 - **Definitions**: `:` `;` `VARIABLE` `CONSTANT` `CREATE` `ALLOT` `DOES>`
   `IMMEDIATE` `ALIAS` `STRUCT` `FIELD` `ENDSTRUCT` `ARRAYS`.
 - **Strings**: `S" ..."` `." ..."` `CHAR` `COUNT` `TYPE` `LEN` `STR@` `STR!`
@@ -144,7 +144,14 @@ words to explore. Categories include:
 - **I/O**: `EMIT` `.` `?.` `.S` `SPACE` `SPACES` `CR` `PAGE` `KEY` `EXPECT`
   `ACCEPT` `READLINE` `ABORT` `ABORT"`.
 - **Bases**: `HEX` `DECIMAL` `OCTAL` `BINARY` `16#` `8#` `2#`
-  `#` `#S` `#>` `>NUMBER` `NUMBER?` `BASE`.
+  `#` `#S` `#>` `>NUMBER` `NUMBER?` `BASE` `BASE@` `BASE!`.
+- **System**: `TIB` `SPAN` `SPAN@` `SPAN!` `>IN` `>IN@` `>IN!` `BLK` `BLK@`
+  `BLK!` `STATE` `SOURCE` `WORD` `WORDS` `INCLUDE`.
+
+`BASE`, `>IN`, `SPAN`, `BLK` push the current *value* of the system variable;
+the `@`/`!` variants read and write the raw cell (e.g. `16 BASE!` selects hex).
+Note that `S" ..."` leaves a counted string, so use `S" hi" COUNT TYPE` (or
+`S." "` / `S.`) rather than `S" hi" TYPE`.
 
 This is not an exhaustive ANSI-FORTH implementation, but it covers the core plus
 the extensions most useful for examples and scripting.
