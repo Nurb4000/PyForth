@@ -74,11 +74,25 @@ class TestStack(unittest.TestCase):
 
 class TestComparison(unittest.TestCase):
     def test_relations(self):
-        self.assertEqual(run_code("3 5 < ."), " -1 ")
-        self.assertEqual(run_code("5 3 > ."), " -1 ")
+        # "x1 x2 <" asks whether x2 is below x1, i.e. the stack is read from
+        # the top down (ANS 6.1.0890 and every other FORTH).
+        self.assertEqual(run_code("3 5 < ."), " 0 ")
+        self.assertEqual(run_code("5 3 < ."), " -1 ")
+        self.assertEqual(run_code("3 5 > ."), " -1 ")
+        self.assertEqual(run_code("5 3 > ."), " 0 ")
         self.assertEqual(run_code("5 5 = ."), " -1 ")
         self.assertEqual(run_code("3 4 <> ."), " -1 ")
         self.assertEqual(run_code("3 3 <> ."), " 0 ")
+
+    def test_relations_equality_edges(self):
+        self.assertEqual(run_code("3 3 < ."), " 0 ")
+        self.assertEqual(run_code("3 3 > ."), " 0 ")
+        self.assertEqual(run_code("3 3 <= ."), " -1 ")
+        self.assertEqual(run_code("3 3 >= ."), " -1 ")
+        self.assertEqual(run_code("3 5 <= ."), " 0 ")
+        self.assertEqual(run_code("5 3 <= ."), " -1 ")
+        self.assertEqual(run_code("3 5 >= ."), " -1 ")
+        self.assertEqual(run_code("5 3 >= ."), " 0 ")
 
     def test_boolean_logic(self):
         self.assertEqual(run_code("0 NOT ."), " -1 ")
@@ -129,12 +143,32 @@ class TestControlStructures(unittest.TestCase):
         )
 
     def test_plusloop_dynamic(self):
+        # A dynamic +LOOP takes its increment from the data stack at the end of
+        # every pass, so "I 1+" doubles the step each time round: 0, 1, 3, 7.
         self.assertEqual(
-            run_code("2 1 10 DO i . +LOOP"), " 1  3  5  7  9 "
+            run_code("0 10 DO I . I 1+ +LOOP"), " 0  1  3  7 "
+        )
+
+    def test_plusloop_dynamic_from_a_word(self):
+        self.assertEqual(
+            run_code(": STEP 2 ; 0 10 DO I . STEP +LOOP"),
+            " 0  2  4  6  8 ",
+        )
+
+    def test_do_counts_down_when_start_above_limit(self):
+        # PyForth's DO is ( start limit -- ), so plain LOOP always runs towards
+        # the limit instead of quietly doing nothing.
+        self.assertEqual(
+            run_code("10 1 DO I . LOOP"), " 10  9  8  7  6  5  4  3  2 "
         )
 
     def test_do_no_iterations(self):
-        self.assertEqual(run_code("10 1 DO i . LOOP"), "")
+        # start == limit: the loop body never runs
+        self.assertEqual(run_code("5 5 DO I . LOOP"), "")
+        self.assertEqual(run_code("5 5 ?DO I . LOOP"), "")
+
+    def test_qdo_skipped_loop(self):
+        self.assertEqual(run_code("1 3 3 ?DO I . LOOP"), "")
 
     def test_if_true(self):
         self.assertEqual(
@@ -412,7 +446,7 @@ class TestRegression(unittest.TestCase):
 
     def test_leave_do_loop(self):
         self.assertEqual(
-            run_code("1 10 DO I . I 3 > IF LEAVE THEN LOOP"), " 1  2  3  4 "
+            run_code("1 10 DO I . I 3 < IF LEAVE THEN LOOP"), " 1  2  3  4 "
         )
 
     def test_leave_nested_do_loop(self):
@@ -431,7 +465,7 @@ class TestRegression(unittest.TestCase):
 
     def test_begin_until_loop(self):
         self.assertEqual(
-            run_code("1 BEGIN DUP . 1+ DUP 5 > UNTIL DROP"), " 1  2  3  4  5 "
+            run_code("1 BEGIN DUP . 1+ DUP 5 < UNTIL DROP"), " 1  2  3  4  5 "
         )
 
     # -- raw Python exceptions become FORTH errors --------------------------
@@ -871,6 +905,196 @@ class TestRegression(unittest.TestCase):
             forth.run("DIVZ")
         forth.run("GOOD .")
         self.assertEqual(forth.output_text(), " 5 ")
+
+    # -- BEGIN ... WHILE ... REPEAT and LEAVE across constructs -------------
+
+    def test_begin_while_repeat(self):
+        self.assertEqual(
+            run_code(": T 0 11 DO I 2 MOD 0 = IF I . THEN LOOP ; T"),
+            " 0  2  4  6  8  10 ",
+        )
+
+    def test_while_false_skips_rest_of_body(self):
+        # A false WHILE must jump past the rest of the loop, not run on.
+        self.assertEqual(
+            run_code(": T 0 BEGIN DUP 3 < WHILE 1+ DUP 99 . REPEAT DROP ; T"),
+            "",
+        )
+
+    def test_while_true_loops(self):
+        self.assertEqual(
+            run_code(": T 0 BEGIN DUP . 1+ DUP 4 > WHILE REPEAT DROP ; T"),
+            " 0  1  2  3 ",
+        )
+
+    def test_leave_from_nested_begin_inside_do(self):
+        # LEAVE with an open BEGIN loop in front of it leaves the BEGIN loop
+        # only; the DO loop carries on with its next iteration.
+        self.assertEqual(
+            run_code(": T 0 3 DO I . I 1+ BEGIN 1- DUP 0 = IF LEAVE "
+                     "THEN DUP 0 > UNTIL DROP LOOP ; T"),
+            " 0  1  2 ",
+        )
+
+    def test_leave_outside_loop_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("LEAVE")
+
+    def test_loop_without_do_raises(self):
+        with self.assertRaises(ForthError):
+            run_code(": T 1 5 I . LOOP ; T")
+
+    def test_do_without_loop_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("1 5 DO I .")
+
+    # -- control-flow state is unwound on error and on EXIT -----------------
+
+    def test_error_inside_loop_leaves_no_state(self):
+        forth = Forth()
+        forth.run(": T 1 5 DO 1 0 / LOOP ;")
+        with self.assertRaises(RuntimeError):
+            forth.run("T")
+        self.assertEqual(forth.loops, [])
+        self.assertEqual(forth.begin_stack, [])
+        self.assertEqual(forth.struct_stack, [])
+        self.assertEqual(forth.case_stack, [])
+        forth.run("1 3 DO I . LOOP")
+        self.assertEqual(forth.output_text(), " 1  2 ")
+
+    def test_exit_inside_nested_loops_clears_state(self):
+        forth = Forth()
+        forth.run(": T 1 3 DO 1 3 DO EXIT LOOP LOOP ;")
+        forth.run("T")
+        self.assertEqual(forth.loops, [])
+        self.assertEqual(forth.ds.depth(), 0)
+        forth.run("2 4 DO I . LOOP")
+        self.assertEqual(forth.output_text(), " 2  3 ")
+
+    def test_recursion_error_is_a_forth_error(self):
+        forth = Forth()
+        forth.run(": LOOP1 LOOP1 ;")
+        with self.assertRaises(ForthError) as cm:
+            forth.run("LOOP1")
+        self.assertIn("recursion", str(cm.exception))
+        self.assertEqual(forth.loops, [])
+
+    def test_reasonable_recursion_depth_still_works(self):
+        # the limit was raised so that ordinary recursive words do not blow up
+        self.assertEqual(run_code(": F DUP 1 > IF DUP 1 - RECURSE THEN ; "
+                                  "40 F ."), " 40 ")
+
+    # -- nested CASE ---------------------------------------------------------
+
+    def test_case_nested(self):
+        forth = Forth()
+        forth.run('1 CASE 1 OF 10 CASE 2 OF S" a2" ENDOF S" a1" ENDCASE '
+                  'ENDOF 2 OF S" two" ENDOF ENDCASE COUNT TYPE DROP')
+        self.assertEqual(forth.output_text(), "a1")
+        self.assertEqual(forth.ds.depth(), 0)
+
+    def test_case_default_branch(self):
+        forth = Forth()
+        forth.run('9 CASE 1 OF S" one" ENDOF 2 OF S" two" ENDOF '
+                  'S" many" ENDCASE COUNT TYPE DROP')
+        self.assertEqual(forth.output_text(), "many")
+        self.assertEqual(forth.ds.depth(), 0)
+
+    def test_case_outside_construct_raises_cleanly(self):
+        with self.assertRaises(ForthError):
+            run_code("5 OF")
+
+    # -- CHAR / lowercase strings / IMMEDIATE -------------------------------
+
+    def test_char_forms(self):
+        self.assertEqual(run_code("[CHAR] A ."), " 65 ")
+        self.assertEqual(run_code("CHAR A ."), " 65 ")
+        self.assertEqual(run_code("65 CHAR ."), " 65 ")
+        self.assertEqual(run_code(": T [CHAR] z ; T ."), " 122 ")
+        self.assertEqual(run_code("34 CHAR EMIT"), '"')
+
+    def test_lowercase_string_word(self):
+        self.assertEqual(run_code('s" hello" COUNT TYPE'), "hello")
+        self.assertEqual(run_code('s" hello" S."'), "hello")
+
+    def test_immediate_secondary_runs_at_compile_time(self):
+        self.assertEqual(
+            run_code(': MYIF POSTPONE IF ; IMMEDIATE : T 1 MYIF '
+                     'S" yes" ELSE S" no" THEN COUNT TYPE DROP ; T'),
+            "yes",
+        )
+
+    def test_immediate_without_definition_raises(self):
+        with self.assertRaises(ForthError):
+            run_code("IMMEDIATE")
+
+    # -- CREATE / , / DOES> -------------------------------------------------
+
+    def test_create_comma_fills_created_word(self):
+        self.assertEqual(run_code("CREATE A 42 , A @ ."), " 42 ")
+        self.assertEqual(run_code("CREATE B 9 B ! B @ ."), " 9 ")
+
+    def test_create_does_at_top_level(self):
+        self.assertEqual(run_code("CREATE C 5 , DOES> @ 1+ ; C ."), " 6 ")
+
+    def test_does_inside_definition_reports_clearly(self):
+        with self.assertRaises(ForthError) as cm:
+            run_code(": M CREATE , DOES> @ ;")
+        self.assertIn("DOES>", str(cm.exception))
+
+    # -- pictured numeric output --------------------------------------------
+
+    def test_picture_hold_and_hash(self):
+        self.assertEqual(run_code("<# 65 HOLD 66 HOLD #> COUNT TYPE"), "BA")
+        self.assertEqual(run_code("<# 65 # # #> COUNT TYPE"), "65")
+        self.assertEqual(run_code("HEX <# FF # # #> COUNT TYPE DECIMAL"), "FF")
+        # "#" takes the low cell from the top, so the high half goes in first
+        self.assertEqual(run_code("<# 0 12345 # # # # # #> COUNT TYPE"),
+                         "12345")
+
+    def test_picture_sign(self):
+        self.assertEqual(run_code("-45 DUP #S SIGN #> COUNT TYPE"), "-45")
+        self.assertEqual(run_code("45 DUP #S SIGN #> COUNT TYPE"), "45")
+
+    def test_picture_overflow_raises(self):
+        with self.assertRaises(ForthError) as cm:
+            run_code(": T 300 0 DO 65 HOLD LOOP #> DROP ; T")
+        self.assertIn("overflow", str(cm.exception))
+
+    def test_picture_is_reusable(self):
+        self.assertEqual(run_code("1 #S #> COUNT TYPE 2 #S #> COUNT TYPE"),
+                         "12")
+
+    # -- number conversion / BASE! ------------------------------------------
+
+    def test_base_store_range(self):
+        # BASE! changes the base; numbers on the same line were already read
+        # in the old base, so check the effect one line later.
+        forth = Forth()
+        forth.run("16 BASE!")
+        forth.run("BASE")
+        self.assertEqual(forth.ds.data, [16])
+        with self.assertRaises(ForthError):
+            run_code("1 BASE!")
+        with self.assertRaises(ForthError):
+            run_code("99 BASE!")
+
+    def test_number_accumulates_in_current_base(self):
+        forth = Forth()
+        forth.run('HEX S" 1F" 0 0 ROT >NUMBER')     # #in #out a#
+        self.assertEqual(forth.ds.data[-2], 31)
+        self.assertEqual(forth.ds.data[-3], 2)
+
+    def test_number_stops_at_invalid_digit(self):
+        forth = Forth()
+        forth.run('S" 12x" 0 0 ROT >NUMBER')
+        self.assertEqual(forth.ds.data[-2], 12)
+        self.assertEqual(forth.ds.data[-3], 2)
+
+    def test_number_past_end_of_string_does_not_crash(self):
+        forth = Forth()
+        forth.run('S" 1" 9 0 ROT >NUMBER')     # #in already past the count
+        self.assertEqual(forth.ds.data[-3], 9)
 
 
 if __name__ == "__main__":

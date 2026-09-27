@@ -2,9 +2,9 @@
 \ Run with:  python -m forth.cli examples/fibonacci.fs
 
 : FIB   ( n -- fib(n) )
-   DUP 2 <=
-     IF  DROP 1
-     ELSE  DUP 1 - FIB  SWAP 2 - FIB  +
+   DUP 2 <            \ 2 below n, i.e. n is greater than 2?
+     IF  DUP 1 - FIB  SWAP 2 - FIB  +
+     ELSE  DROP 1
    THEN
 ;
 

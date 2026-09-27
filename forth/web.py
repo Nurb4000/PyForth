@@ -39,12 +39,16 @@ from flask import (
 from .machine import Forth
 
 
+#: Per-request execution cap, so a runaway loop cannot pin a worker.
+MAX_STEPS = 10_000_000
+#: Largest accepted source text, to keep one request from eating all memory.
+MAX_CODE_BYTES = 64 * 1024
+
+
 def _new_app():
-    app = Flask(__name__)
+    app = Flask(__name__, template_folder="templates", static_folder="static")
     app.secret_key = os.environ.get("PYFORTH_SECRET_KEY") or secrets.token_hex(32)
     app.config["forth_instances"] = {}
-    app.config["template_folder"] = "templates"
-    app.config["static_folder"] = "static"
 
     def forth_for_session():
         token = session.get("token")
@@ -56,9 +60,9 @@ def _new_app():
             # Bound memory: drop the oldest session's interpreter.
             instances.pop(next(iter(instances)))
         if token not in instances:
-            instances[token] = Forth()
-            # Bound the per-request cost so a runaway loop cannot pin a worker.
-            instances[token].max_steps = 10_000_000
+            forth = Forth()
+            forth.max_steps = MAX_STEPS
+            instances[token] = forth
         return instances[token]
 
     @app.route("/")
@@ -69,6 +73,15 @@ def _new_app():
     def run():
         data = request.get_json(silent=True) or {}
         code = data.get("code", "")
+        if not isinstance(code, str):
+            return jsonify({"output": "",
+                            "error": "code must be a string"}), 400
+        if len(code.encode("utf-8", "replace")) > MAX_CODE_BYTES:
+            return jsonify({
+                "output": "",
+                "error": "source text is larger than {} bytes".format(
+                    MAX_CODE_BYTES),
+            }), 413
         forth = forth_for_session()
         forth.clear_output()
         # Expose the incoming text to KEY / EXPECT as well.
@@ -79,10 +92,14 @@ def _new_app():
             forth.abort()
             text = forth.output_text()
             forth.clear_output()
-            message = str(error)
-            if text:
-                message = text + "\n" + message
-            return jsonify({"output": "", "error": message})
+            # The output produced before the error is still worth showing, so
+            # it travels in "output" and the JS prints both in order.
+            return jsonify({"output": text, "error": str(error)})
+        finally:
+            # KEY / EXPECT input is scoped to one request: drop whatever the
+            # run did not consume so it cannot bleed into the next request.
+            # (Pass the text a program should read in the same request.)
+            forth.reset_input()
         output = forth.output_text()
         return jsonify({"output": output, "error": None})
 

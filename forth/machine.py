@@ -9,11 +9,17 @@ with back-patching, which keeps the runtime loop simple and correct.
 from __future__ import annotations
 
 import string
+import sys
 
 
 CELL_BITS = 64
 CELL_MASK = (1 << CELL_BITS) - 1
 SIGN_BIT = 1 << (CELL_BITS - 1)
+
+# Every nested FORTH call costs a few Python frames, so the interpreter needs
+# more headroom than CPython's default when user code recurses.  Hitting the
+# limit is still reported as a ForthError (see ``Forth.execute_body``).
+RECURSION_LIMIT = 12000
 
 
 def to_cell(n):
@@ -24,8 +30,13 @@ def to_cell(n):
     return n
 
 
-class ForthError(Exception):
-    """Raised to abort the current computation and return to the top level."""
+class ForthError(RuntimeError):
+    """Raised to abort the current computation and return to the top level.
+
+    It derives from RuntimeError because much of the word set reports bad
+    arguments (LN of a negative, odd BASE, ...) that way, so user code that
+    catches RuntimeError keeps catching interpreter errors as well.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +188,8 @@ class Tokenizer:
                     i += 1
                 toks.append(Tok("paren", None))
                 continue
-            if c == "S" and i + 1 < n and line[i + 1] == '"':
-                i += 2  # skip opening S"
+            if c in "Ss" and i + 1 < n and line[i + 1] == '"':
+                i += 2  # skip opening S" / s"
                 content, i = self._read_string(
                     line, self._after_string_delim(line, i, n), n)
                 toks.append(Tok("str", content))
@@ -351,16 +362,18 @@ class _CompileState:
 
 class Forth:
     def __init__(self):
+        if sys.getrecursionlimit() < RECURSION_LIMIT:
+            sys.setrecursionlimit(RECURSION_LIMIT)
         self.ds = DataStack("data", 8192, growing_down=False)
         self.rs = ReturnStack("return", 8192, growing_down=True)
         self.mem = Memory()
         self.dict = {}            # name -> DictEntry
         self.uv = {}              # user variable name -> address (stored in mem)
         self.user = {"BASE": 10, ">IN": 0, "BLK": 0, "SPAN": 0}
-        self.loops = []           # DO/LOOP index stack for I/J/K: [i, nlim]
+        self.loops = []           # DO/LOOP index stack for I/J/K: [i, nlim, step]
         self.while_stack = []     # flags for BEGIN/WHILE/THEN loops
-        self.begin_stack = []     # indices of open BEGINs
-        self.struct_stack = []    # stack of 'if'/'begin' markers for THEN
+        self.begin_stack = []     # [begin index, while depth] of open BEGINs
+        self.struct_stack = []    # 'begin' markers of open BEGINs
         self.case_stack = []      # selector positions of open CASE constructs
         self.compiling = False
         self.current = None
@@ -368,6 +381,9 @@ class Forth:
         self._pending_does = None # word being finished by a DOES> 
         self.compile_state = _CompileState()
         self.output = []          # captured output buffer
+        # pictured numeric output state (<# HOLD # #S SIGN #>)
+        self.picture_ptr = None    # None = no pictured conversion in progress
+        self.picture_done = None   # address of the last finished picture
         # stack-pointer pseudo-addresses (set/read by SP! / SP@ / RS@)
         self.sp_addr = 0
         self.rs_addr = 0
@@ -569,6 +585,27 @@ class Forth:
         self._pending_does = None
         self.compile_state.reset()
 
+    def ctrl_mark(self):
+        """Snapshot the depth of every control-flow stack.
+
+        Used by :meth:`execute_body` so that leaving a definition early
+        (``EXIT``, ``LEAVE`` or an error) cannot leave a loop or ``BEGIN``
+        behind on the interpreter's control stacks.
+        """
+        return (len(self.loops), len(self.begin_stack), len(self.struct_stack),
+                len(self.case_stack), len(self.while_stack))
+
+    def ctrl_unwind(self, mark):
+        """Restore the control-flow stacks to the depths recorded in ``mark``."""
+        if mark is None:
+            return
+        nloops, nbegin, nstruct, ncase, nwhile = mark
+        del self.loops[nloops:]
+        del self.begin_stack[nbegin:]
+        del self.struct_stack[nstruct:]
+        del self.case_stack[ncase:]
+        del self.while_stack[nwhile:]
+
     def _process(self, toks):
         """Convert tokens to cells and either compile them into the current
         definition (compile mode) or execute them (interpret mode)."""
@@ -656,18 +693,32 @@ class Forth:
                 continue
 
             if name in ("CHAR", "[CHAR]"):
-                # CHAR / [CHAR] consume the following token as a single
-                # character.  They need lookahead, so handle them here rather
-                # than at runtime.
+                # CHAR ( "char" -- char ) parses the next token, but the common
+                # extension "65 CHAR" takes its value from the stack instead.
+                # A following token that is itself a dictionary word is a word,
+                # not a character name, so the stack form is used there (and
+                # 'x' / "x" always mean the character x).
                 dest = self.current.body if in_body() else temp
-                if i < n and toks[i].kind in ("word", "num", "str"):
-                    value = str(toks[i].value or "")
-                    ch = value[0] if value else " "
-                    i += 1
+                ch = None
+                if i < n:
+                    nxt = toks[i]
+                    if nxt.kind == "str":
+                        text = nxt.value or " "
+                        ch = text[0]
+                        i += 1
+                    elif nxt.kind == "word" and (
+                            name == "[CHAR]"
+                            or self.find(nxt.value.upper()) is None):
+                        text = nxt.value or " "
+                        ch = text[0]
+                        i += 1
+                if ch is not None:
+                    self._flush(dest)
+                    dest.append(["lit", to_cell(ord(ch))])
                 else:
-                    ch = " "
-                self._flush(dest)
-                dest.append(["lit", to_cell(ord(ch))])
+                    # Stack form: leave the value on the stack and call CHAR.
+                    self._flush(dest)
+                    dest.append(["prim", "CHAR"])
                 continue
             if name == "[']":
                 # ['] NAME : push the entry address of NAME (for EXECUTE).  The
@@ -746,9 +797,23 @@ class Forth:
                     cs.advance_by = 0
                 continue
 
-            # Immediate words run their compile action while compiling a
-            # definition, which lets them consume the following tokens
-            # (LITERAL takes its value, POSTPONE / ['] take a word name, ...).
+            # Immediate words act at compile time: a word defined with ':' has
+            # its body compiled into the definition being built (so
+            # ": MYIF POSTPONE IF ; IMMEDIATE" can generate control
+            # structures), while a primitive runs its compile action, which is
+            # what lets it consume the following tokens (LITERAL takes a value,
+            # POSTPONE / ['] take a name, ...).
+            if self.compiling and entry.immediate and in_body() \
+                    and entry.body is not None:
+                self._flush(self.current.body)
+                cells = entry.body
+                if cells and cells[-1][0] == "exit":
+                    # Drop the ';' terminator: the words it compiled belong to
+                    # the definition being built, not to the end of it.
+                    cells = cells[:-1]
+                self.current.body.extend(cells)
+                continue
+
             if self.compiling and entry.immediate and p is not None \
                     and p.compile is not None:
                 p.compile(self, toks, i)
@@ -826,10 +891,23 @@ class Forth:
         entry.primary.execute(self)
 
     def execute_body(self, body):
+        """Run a secondary definition's cells, absorbing an ``EXIT``.
+
+        The control-flow stacks are restored to their entry depth no matter how
+        the word is left, so a word that exits from inside a loop cannot leak
+        loop or ``BEGIN`` state into its caller.
+        """
+        mark = self.ctrl_mark()
         try:
             self.exec_tokens(body, 0, len(body))
         except _ExitSignal:
             pass
+        except RecursionError:
+            raise ForthError(
+                "recursion too deep (a word is calling itself without end)"
+            ) from None
+        finally:
+            self.ctrl_unwind(mark)
 
     # -- unified token/cell executor --------------------------------------
     # A "cell" is a small list [tag, value] where tag is one of:
@@ -860,7 +938,10 @@ class Forth:
                 self.ds.push(val)
                 i += 1
             elif tag == "sec":
-                self.execute_word(c[1])
+                entry = self.find(c[1])
+                if entry is None or entry.body is None:
+                    raise ForthError(f"?NAME? {c[1]}")
+                self.execute_body(entry.body)
                 i += 1
             elif tag == "exit":
                 return i
@@ -886,46 +967,63 @@ class Forth:
     OPENERS = {"IF", "DO", "?DO", "BEGIN", "WHILE", "CASE", "OF"}
     CLOSERS = {"THEN", "LOOP", "+LOOP", "AGAIN", "UNTIL", "REPEAT", "ENDOF", "ENDCASE"}
 
-    def find_match(self, cells, i, closer_names, start_depth=1, require_depth=True):
-        """Scan forward from ``i`` for the first loop-terminator cell.
+    def find_match(self, cells, i, closer_names, require_depth=True):
+        """Scan forward from ``i`` for the cell that closes the construct at ``i``.
 
         A terminator is a ``["prim", "LOOP"/"+LOOP"]`` cell whose name is in
         ``closer_names``, or a ``["ploop", step]`` cell (constant-step +LOOP).
-        When ``require_depth`` is true (the DO/LOOP case) the match must occur
-        at nesting depth zero; LEAVE uses ``require_depth=False`` to jump to the
-        nearest terminator regardless of nesting.
+        With ``require_depth`` (the default) a terminator that belongs to a
+        construct nested inside the one at ``i`` does not count.
+
+        The scan keeps a stack of the constructs it passes, which matters for
+        ``BEGIN ... WHILE ... REPEAT``: there ``REPEAT`` closes both the
+        ``WHILE`` and the ``BEGIN``, while a bare ``THEN`` closes only a
+        ``WHILE``.  A terminator that belongs to a construct *outside* the one
+        being matched (the ``AGAIN`` of a ``BEGIN`` that starts before the
+        current ``IF``, say) is stepped over instead of ending the search.
         """
-        depth = start_depth
-        n = len(cells)
+        stack = []
         j = i + 1
-        while j < n:
+        while j < len(cells):
             c = cells[j]
             tag = c[0]
             if tag == "ploop":
+                # A constant-step +LOOP acts as a "+LOOP" closer.
                 if not require_depth:
-                    return j
-                # A constant-step +LOOP acts as a "+LOOP" closer and must be
-                # counted at the proper nesting depth so an inner loop's
-                # terminator does not hijack an outer DO/IF scan.
-                depth -= 1
-                if depth == 0 and "+LOOP" in closer_names:
-                    return j
+                    if "+LOOP" in closer_names:
+                        return j
+                elif not stack:
+                    if "+LOOP" in closer_names:
+                        return j
+                else:
+                    stack.pop()
                 j += 1
                 continue
             if tag != "prim":
                 j += 1
                 continue
             v = c[1]
-            if require_depth:
-                if v in self.OPENERS:
-                    depth += 1
-                elif v in self.CLOSERS:
-                    depth -= 1
-                    if depth == 0 and v in closer_names:
-                        return j
-            else:
+            if not require_depth:
                 if v in closer_names:
                     return j
+                j += 1
+                continue
+            if v in self.OPENERS or v == "WHILE":
+                stack.append(v)
+            elif v == "REPEAT":
+                # REPEAT closes the loop's own WHILE and the BEGIN with it.
+                while stack and stack[-1] != "BEGIN":
+                    stack.pop()
+                if stack:
+                    stack.pop()
+            elif v in self.CLOSERS:
+                if not stack:
+                    # Nothing nested here: this can only close the construct at
+                    # i (and be its terminator) or an enclosing one.
+                    if v in closer_names:
+                        return j
+                else:
+                    stack.pop()
             j += 1
         return None
 

@@ -51,9 +51,23 @@ Run a file in batch mode (no REPL, exits when done):
 python -m forth -b examples/hello.fs
 ```
 
+Options:
+
+```
+python -m forth [-b] [-i] [--max-steps N] [file.fs ...]
+```
+
+- `-b`, `--batch` — run the files and exit instead of opening the REPL.
+- `-i`, `--interactive` — always open the REPL, even with no files given.
+- `--max-steps N` — stop a line after N executed words (`0` = no limit,
+  default 10,000,000). Useful when a program loops forever.
+- `-h`, `--help` — usage summary.
+
 At the prompt, type FORTH code and press Enter. Type `bye` (or `quit`) to
-exit, or `"path/to/file.fs"` to load and run a file. The special word `?`
-reads and runs a line from standard input.
+exit, or `"path/to/file.fs"` to load and run a file (the quotes are part of the
+syntax). The special word `?` reads and runs a line from standard input.
+Pressing Ctrl-C aborts the current line — including a runaway loop — and drops
+back to the prompt with the dictionary intact.
 
 A `: ... ;` definition may span several lines: continuation lines are
 collected silently and a single `ok` is printed when the closing `;` is seen.
@@ -86,11 +100,11 @@ API endpoints (used by the UI):
 ## Python API
 
 ```python
-from forth import Forth
+from forth.machine import Forth, ForthError
 
 forth = Forth()
 forth.run(
-    ": SQUARE 2 ** ;\n"
+    ": SQUARE DUP * ;\n"
     "1 10 DO I SQUARE . LOOP",
 )
 print(forth.output_text())   # -> ' 1  4  9  16  25  36  49  64  81 '
@@ -104,9 +118,16 @@ print(forth.output_text())   # -> ' 8 '
 try:
     forth.interpret(". ")    # empty stack -> underflow
 except ForthError as err:
-    print("error:", err)
+    print("error:", err)     # ForthError is a RuntimeError subclass
 forth.abort()                # discard stacks/control state, keep definitions
+
+# Bound the work a single run may do (None = no limit):
+forth.max_steps = 1_000_000
 ```
+
+`forth.max_steps` counts executed words and raises `ForthError` when the cap is
+passed, so a runaway loop reports an error instead of hanging. Both front-ends
+set it (`--max-steps` on the command line, 10 million per request in the browser).
 
 Key methods on `Forth`:
 
@@ -131,20 +152,41 @@ words to explore. Categories include:
 - **Arithmetic**: `+` `-` `*` `/` `MOD` `NEGATE` `ABS` `1+` `1-` `2*` `2/`
   `FM/` `UM/M` `UM/DP` `/+` `-/` `SQRT` `POW` `**` `EXP` `LN` `LOG` `SIN` `COS`
   `TAN` `ATAN` `AT2` `CEIL` `FLOOR` `TRUNC` `FRAC`.
-- **Comparison**: `=` `<>` `<` `>` `<=` `>=` `0=` `0<` `0>` `1<` `2>` and family.
+- **Comparison**: `=` `<>` `<` `>` `<=` `>=` `0=` `0<` `0>` `1<` `2>`
+  `WITHIN` and family. Relational words use the standard stack order, so
+  `3 5 <` is false (it asks "is 5 below 3?") and `3 5 >` is true.
 - **Bitwise**: `AND` `OR` `XOR` `NOT` `LSHIFT` `RSHIFT` `?LSHIFT` `?RSHIFT`.
 - **Memory**: `@` `!` `+!` `@+` `@-` `C@` `C!` `CHAIN` `SP@` `SP!` `RS@`.
 - **Control**: `IF`/`ELSE`/`THEN`, `DO`/`+LOOP`/`?DO`/`LOOP`/`UNDO`,
   `BEGIN`/`WHILE`/`REPEAT`/`UNTIL`/`AGAIN`, `CASE`/`OF`/`ENDOF`/`ENDCASE`,
   `LEAVE`, `'` (tick, for `EXECUTE`), and recursion by direct self-reference.
 - **Definitions**: `:` `;` `VARIABLE` `CONSTANT` `CREATE` `ALLOT` `DOES>`
-  `IMMEDIATE` `ALIAS` `STRUCT` `FIELD` `ENDSTRUCT` `ARRAYS`.
+  `IMMEDIATE` `ALIAS` `STRUCT` `FIELD` `ENDSTRUCT` `ARRAYS`. The size comes
+  *before* the word, and a struct's first field shares the struct's own address:
+  ```
+  3 STRUCT POINT  FIELD X  FIELD Y  FIELD Z  ENDSTRUCT
+  11 X !  22 Y !  33 Z !   X @ . Y @ . Z @ .   \ prints  11  22  33
+  6 ARRAYS SQUARES           \ six zeroed cells, SQUARES pushes the address
+  7 SQUARES 2 + !            \ stores into the third element
+  ```
 - **Strings**: `S" ..."` `." ..."` `CHAR` `COUNT` `TYPE` `LEN` `STR@` `STR!`
   `STRING=` `STRING<` `STRING>` `WORD` `SOURCE`.
 - **I/O**: `EMIT` `.` `?.` `.S` `SPACE` `SPACES` `CR` `PAGE` `KEY` `EXPECT`
   `ACCEPT` `READLINE` `ABORT` `ABORT"`.
 - **Bases**: `HEX` `DECIMAL` `OCTAL` `BINARY` `16#` `8#` `2#`
-  `#` `#S` `#>` `>NUMBER` `NUMBER?` `BASE` `BASE@` `BASE!`.
+  `BASE` `BASE@` `BASE!` (which rejects anything outside 2 .. 36).
+- **Pictured numeric output**: `<#` `HOLD` `#` `#S` `SIGN` `#>`, which build a
+  counted string in `PAD`:
+  ```
+  : UD.  <# #S #> TYPE ;
+  1234 UD.            \ prints 1234
+  -45 UD.             \ prints -45
+  HEX 1F UD.          \ prints 1F
+  <# 65 HOLD 66 HOLD #> COUNT TYPE   \ prints BA (first held char ends up right)
+  ```
+  `<#` is optional in PyForth, so `1234 #S #>` also works. `#` converts a
+  single digit and takes the low cell from the top of the stack, so put the
+  high half underneath: `<# 0 12345 # # # # # #> COUNT TYPE`.
 - **System**: `TIB` `SPAN` `SPAN@` `SPAN!` `>IN` `>IN@` `>IN!` `BLK` `BLK@`
   `BLK!` `STATE` `SOURCE` `WORD` `WORDS` `INCLUDE`.
 
@@ -155,6 +197,40 @@ Note that `S" ..."` leaves a counted string, so use `S" hi" COUNT TYPE` (or
 
 This is not an exhaustive ANSI-FORTH implementation, but it covers the core plus
 the extensions most useful for examples and scripting.
+
+### Deviations worth knowing
+
+- **`DO` takes `( start limit -- )`**, i.e. the start is pushed first, which is
+  the opposite of the ANSI `( limit start -- )`. This is PyForth's long-standing
+  convention and the examples rely on it. Plain `LOOP` therefore always counts
+  *towards* the limit: `1 10 DO ... LOOP` runs 1 .. 9, and `10 1 DO ... LOOP`
+  counts 10 down to 2 instead of doing nothing.
+- **`+LOOP` with a runtime increment** (`n +LOOP`) reads its increment from the
+  data stack at the end of every pass, so the body has to leave a value behind
+  each time: `0 10 DO I . 1 +LOOP` counts 0 .. 9. A constant step written
+  literally in front of `+LOOP` (`2 +LOOP`) is compiled in, as usual.
+- **Numbers are converted when the line is read**, so changing the base halfway
+  through a line does not affect the numbers already on it. Use a separate line
+  (or a word) after `HEX` / `DECIMAL`.
+- **`>NUMBER` uses `( #in #out a# -- #in' #out' a# )`** — the order of the
+  original implementation rather than the ANS `( ud a# u -- )`. It converts the
+  whole leading run of valid digits in the current base.
+- **`DOES>` only works at the top level**: `CREATE NAME ... DOES> ... ;`. Inside
+  a colon definition it reports a clear error instead of building a broken
+  defining word.
+- **`CREATE` names the cell at `HERE`** and does not reserve it, so a following
+  `,` or `ALLOT` fills it: `CREATE A 42 , A @ .` prints 42.
+- **`ALLOT` reserves cells, not bytes**, so reserve generously.
+- Single-cell machine: there is no double-cell arithmetic, so `#` / `#S` convert
+  single cells and `FM/`-style words return quotient and remainder.
+- **`WORD` re-reads the parse area** (`SOURCE` buffer) rather than the token
+  stream, so put the delimiter on the stack *before* `WORD` and remember that
+  the text it consumed is still interpreted normally afterwards:
+  ```
+  32 WORD my-token COUNT TYPE   \ print the next space-delimited token
+  ```
+- **`:NONAME` is not implemented**; compile-time words such as `POSTPONE`,
+  `[']` and `LITERAL` only work inside a colon definition, as intended.
 
 ## Examples
 
@@ -180,8 +256,10 @@ python -m unittest discover -s tests
 python tests/test_forth.py
 ```
 
-It covers arithmetic, stack words, bases, control structures, strings, arrays,
-I/O, error handling, and both front-ends.
+It covers arithmetic, stack words, comparison order, bases, control structures
+(including `LEAVE`, `CASE` and control-flow state cleanup after errors),
+strings, pictured output, `CREATE`/`DOES>`, I/O, error handling, and both
+front-ends.
 
 ## Project layout
 

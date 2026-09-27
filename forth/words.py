@@ -220,7 +220,6 @@ def register_words(f):
     add("-/", P(_minusdiv))
     # floating point extensions (operate on the data stack as cells)
     add("SQRT", P(_sqrt))
-    add("ABS", P(_abs))
     add("CEIL", P(_ceil))
     add("FLOOR", P(_floor))
     add("FRAC", P(_frac))
@@ -306,7 +305,7 @@ def register_words(f):
     # for the less common "poke the raw cell" idiom.
     add("BASE", P(lambda f: f.ds.push(f.mem.cell_get(f.uv["BASE"]))))
     add("BASE@", P(lambda f: f.ds.push(f.uv["BASE"])))
-    add("BASE!", P(lambda f: f.mem.cell_set(f.uv["BASE"], f.ds.pop())))
+    add("BASE!", P(_base_store))
     add(">IN", P(lambda f: f.ds.push(f.mem.cell_get(f.uv[">IN"]))))
     add(">IN@", P(lambda f: f.ds.push(f.uv[">IN"])))
     add(">IN!", P(lambda f: f.mem.cell_set(f.uv[">IN"], f.ds.pop())))
@@ -333,8 +332,11 @@ def register_words(f):
     # =======================================================================
     # Number conversion: # #S #> >NUMBER NUMBER?
     # =======================================================================
+    add("<#", P(_picture_begin))
+    add("HOLD", P(_hold))
     add("#", P(_hash))
     add("#S", P(_hashs))
+    add("SIGN", P(_sign))
     add("#>", P(_hashgt))
     add(">NUMBER", P(_numbertonumber))
     add("NUMBER?", P(_numberq, compile=_compile_numberq))
@@ -382,7 +384,8 @@ def register_words(f):
     add("[COMPILE]", P(_noop_execute, compile=_compile_compile), immediate=True)
     add("LITERAL", P(_literal, compile=_compile_literal), immediate=True)
     add("POSTPONE", P(_postpone, compile=_compile_postpone), immediate=True)
-    add("IMMEDIATE", P(_immediate), immediate=True)
+    add("IMMEDIATE", P(_immediate, compile=_compile_immediate, defining=True),
+        immediate=True)
     add("EXIT", P(_exit, compile=_compile_exit), immediate=True)
     add("RECURSE", P(_recurse, compile=_compile_recurse), immediate=True)
     add("EXECUTE", P(_execute))
@@ -752,17 +755,21 @@ def _eq2(f):
 def _neq(f):
     b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if a != b else 0))
 
+# Relational words use the ANS stack order: "x1 x2 <" is true when x2 is less
+# than x1, i.e. the word answers the question the FORTH programmer means when
+# reading the stack from bottom to top (3 5 < asks "is 5 below 3?").
+
 def _lt(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if a < b else 0))
+    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if b < a else 0))
 
 def _gt2(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if a > b else 0))
+    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if b > a else 0))
 
 def _le(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if a <= b else 0))
+    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if b <= a else 0))
 
 def _ge(f):
-    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if a >= b else 0))
+    b = f.ds.pop(); a = f.ds.pop(); f.ds.push(to_cell(-1 if b >= a else 0))
 
 def _zpe(f):
     a = f.ds.pop(); f.ds.push(to_cell(-1 if a == 0 else 0))
@@ -1020,31 +1027,130 @@ def _compile_base_prefix(f, toks, i):
 # Number conversion words
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pictured numeric output:  <#  HOLD  #  #S  SIGN  #>
+# ---------------------------------------------------------------------------
+#
+# The picture is built downwards from the top of PAD: the first character
+# written ends up right-justified, and the count byte lives at PAD itself, so
+# the result is a normal counted string that COUNT/TYPE can consume.
+
+def _picture_begin(f):
+    # ( -- ) start a pictured numeric conversion
+    f.picture_ptr = 255
+
+
+def _picture_ensure(f):
+    """Start a picture implicitly when "<#" was left out.
+
+    PyForth has always allowed "123 #S #>" without the "<#", so the conversion
+    words do not insist on it; only an overflowing picture is an error.  A
+    picture that was already finished is also restarted, so two conversions in a
+    row work, while a second "#>" of the same picture (as in "DUP #S SIGN #>")
+    keeps returning the string that was just built.
+    """
+    if f.picture_ptr is None:
+        f.picture_ptr = 255
+        f.picture_done = None
+
+
+def _hold_char(f, ch):
+    """Put one character into the picture.
+
+    The picture grows downwards from the top of PAD, so the *first* character
+    held ends up furthest right -- which is what "#"/"#S" need, since they hand
+    over the digits least-significant first.  One byte below the last character
+    has to stay free for the count byte that "#>" writes, hence the < 2 test.
+    """
+    _picture_ensure(f)
+    f.picture_done = None
+    if f.picture_ptr < 2:
+        raise ForthError("pictured numeric overflow")
+    f.picture_ptr -= 1
+    f.mem.cset(_pad(f) + f.picture_ptr, ch)
+
+
+def _hold(f):
+    # ( char -- ) append one character to the picture
+    _hold_char(f, f.ds.pop() & 0xFF)
+
+
 def _hash(f):
-    # ( n -- 0 ) convert n to its textual form in the current base and store it
-    # in PAD as a counted string; the pushed zero acts as the "done" marker.
+    # ( ud1 -- ud2 ) convert the next digit, leaving the quotient split into
+    # the high and low cell of the result (both zero once n runs out).
+    _picture_ensure(f)
     n = f.ds.pop()
     base = f.mem.cell_get(f.uv["BASE"])
-    _write_string_to_mem(f, _number_to_str(f, n, base), _pad(f))
-    f.ds.push(0)
+    _hold_char(f, ord(_DIGITS[n % base]))
+    quot = n // base
+    f.ds.push(to_cell(quot // base))
+    f.ds.push(to_cell(quot))
+
 
 def _hashs(f):
-    # ( n -- 0 ) convert the full value (not just one digit) into PAD.
-    return _hash(f)
+    # ( ud -- ) convert the whole value.  A negative single-cell number gets its
+    # sign for free so that "-45 #S #>" works like the rest of PyForth; the
+    # sign is held *after* the digits so that it ends up in front of them.
+    _picture_ensure(f)
+    n = f.ds.pop()
+    base = f.mem.cell_get(f.uv["BASE"])
+    negative = n < 0
+    if negative:
+        n = -n
+    if n == 0:
+        _hold_char(f, ord("0"))
+    else:
+        while n != 0:
+            _hold_char(f, ord(_DIGITS[n % base]))
+            n //= base
+    if negative:
+        _hold_char(f, ord("-"))
+
+
+def _sign(f):
+    # ( n -- c-addr ) add a minus sign when n is negative, then finish.
+    # "#S" already signs negative single-cell numbers, so a sign that is
+    # already there is not doubled ("-7 DUP #S SIGN #>" gives "-7").
+    n = f.ds.pop()
+    if n < 0:
+        _picture_ensure(f)
+        already = (f.picture_ptr < 255
+                   and f.mem.cget(_pad(f) + f.picture_ptr) == ord("-"))
+        if not already:
+            _hold_char(f, ord("-"))
+    f.ds.push(to_cell(n))
+    _hashgt(f)
+
 
 def _hashgt(f):
-    # ( -- a# ) hand back the address of the converted string in PAD.
-    f.ds.push(_pad(f))
+    # ( -- c-addr ) finish the picture and return the counted string.
+    # The digits sit just below the top of PAD, so the count byte goes right
+    # underneath them and the resulting string is left starting there.
+    pad = _pad(f)
+    if f.picture_ptr is None:
+        f.ds.push(f.picture_done if f.picture_done is not None else pad)
+        return
+    addr = pad + f.picture_ptr - 1
+    f.mem.cset(addr, 255 - f.picture_ptr)
+    f.picture_ptr = None
+    f.picture_done = addr
+    f.ds.push(addr)
+
 
 def _numbertonumber(f):
-    # ( #in #out a# -- #in' #out' a# ) accumulate a number in given base
+    # ( #in #out a# -- #in' #out' a# ) convert the leading digits of the
+    # counted string at a# into out, in the current BASE.  PyForth keeps the
+    # #in / #out / a# order of the original implementation.
     a = f.ds.pop()
     out = f.ds.pop()
     inn = f.ds.pop()
     base = f.mem.cell_get(f.uv["BASE"])
-    digit = f.mem.cget(a + inn) - ord("0")
-    if 0 <= digit < base:
-        out = out * base + digit
+    length = f.mem.cget(a)
+    while inn < length:
+        d = _DIGITS.find(chr(f.mem.cget(a + 1 + inn)).upper())
+        if not 0 <= d < base:
+            break
+        out = out * base + d
         inn += 1
     f.ds.push(inn); f.ds.push(out); f.ds.push(a)
 
@@ -1224,8 +1330,9 @@ def _string_gt(f):
     _string_cmp(f, 1)
 
 def _char(f):
-    c = f.ds.pop()
-    f.ds.push(to_cell(ord(chr(c))))
+    # ( x -- x ) stack form: the value already is the character code.  Using
+    # ord(chr(x)) here would break for codes above 255 and masked nothing.
+    f.ds.push(f.ds.peek())
 
 def _compile_char(f, toks, i):
     name = toks[i].value if i < len(toks) else ""
@@ -1313,8 +1420,14 @@ def _compile_postpone(f, toks, i):
 
 def _immediate(f):
     if f.last_word is None:
-        raise RuntimeError("IMMEDIATE without a definition")
+        raise ForthError("IMMEDIATE without a definition")
     f.last_word.immediate = True
+
+def _compile_immediate(f, toks, i):
+    # IMMEDIATE has to take effect exactly where it appears, which includes the
+    # top-level ": NAME ... ; IMMEDIATE" form, so it is registered as a defining
+    # word (the compiler runs a defining word's compile action in place).
+    _immediate(f)
 
 def _exit(f):
     raise ForthError("EXIT outside a definition")
@@ -1516,14 +1629,17 @@ def _create(f):
     pass
 
 def _compile_create(f, toks, i):
+    # CREATE names the cell that sits at HERE right now; it does not take that
+    # cell away from the programmer, so a following "," or ALLOT fills it:
+    #   CREATE A  42 ,  A @ .        \ prints 42
     if f.compiling:
-        addr = f.mem.alloc_cell()
+        addr = f.mem.next_cell_addr
         f.current.body.append(["lit", addr])
         f.last_word = f.current
         return
     name = _next_name(f, toks, i, "CREATE")
     f.compile_state.advance_by = i + 1
-    addr = f.mem.alloc_cell()
+    addr = f.mem.next_cell_addr
     e = f.new_secondary(name)
     e.body = [["lit", addr], ["exit", 0, -1]]
     f.last_word = e
@@ -1540,7 +1656,19 @@ def _compile_allot(f, toks, i):
     for _ in range(n):
         f.mem.alloc_cell()
 
+def _base_store(f):
+    # ( n -- ) set the number base; only 2 .. 36 make sense
+    base = f.ds.pop()
+    if not 2 <= base <= 36:
+        raise ForthError("BASE must be between 2 and 36")
+    f.mem.cell_set(f.uv["BASE"], base)
+
+
 def _compile_does(f, toks, i):
+    if f.compiling:
+        raise ForthError(
+            "DOES> inside a definition is not supported; "
+            "use CREATE ... DOES> at the top level")
     word = f.last_word
     if word is None or word.body is None:
         raise RuntimeError("DOES> without a defining word")
@@ -1556,19 +1684,19 @@ def _compile_does(f, toks, i):
 # ---------------------------------------------------------------------------
 
 def _find_else(f, cells, i, t):
-    """Return the index of the ELSE matching the IF at ``i`` (before ``t``)."""
+    """Return the index of the ELSE matching the IF at ``i`` (before ``t``).
+
+    Inner constructs are stepped over, so an ELSE that belongs to a loop nested
+    in the IF is not mistaken for this IF's ELSE.
+    """
     depth = 0
-    j = i + 1
-    n = len(cells)
-    while j < t and j < n:
+    for j in range(i + 1, t):
         c = cells[j]
         if c[0] == "ploop":
             # Constant-step +LOOP acts as a "+LOOP" closer here too.
-            depth -= 1
-            j += 1
+            depth = max(0, depth - 1)
             continue
         if c[0] != "prim":
-            j += 1
             continue
         v = c[1]
         if v in f.OPENERS:
@@ -1577,20 +1705,81 @@ def _find_else(f, cells, i, t):
             if depth == 0:
                 return j
         elif v in f.CLOSERS:
-            depth -= 1
-        j += 1
+            depth = max(0, depth - 1)
     return None
 
 
-def _find_first(f, cells, i, names):
-    j = i + 1
-    n = len(cells)
-    while j < n:
+def _open_constructs(f, cells, i):
+    """Return the DO/?DO/BEGIN constructs that are still open at index ``i``.
+
+    The list is ordered outermost-first, so its last entry is the innermost
+    construct -- the one that ``LEAVE`` (and a false ``WHILE``) must act on.
+    The answer is derived from the cells themselves rather than from the
+    interpreter's control stacks, so it stays correct for a word that is
+    called recursively or from inside a loop of its caller.
+    """
+    stack = []
+    for j in range(i):
         c = cells[j]
-        if c[0] == "prim" and c[1] in names:
-            return j
-        j += 1
+        if c[0] != "prim":
+            continue
+        v = c[1]
+        if v in ("DO", "?DO", "BEGIN"):
+            stack.append((v, j))
+        elif v in ("LOOP", "+LOOP", "AGAIN", "UNTIL", "REPEAT"):
+            if stack:
+                stack.pop()
+    return stack
+
+
+def _find_begin_end(f, cells, start):
+    """Index of the terminator that closes the BEGIN at ``start``.
+
+    The terminator is ``AGAIN``, ``UNTIL``, ``REPEAT`` or the ``THEN``/``REPEAT``
+    of the loop's own ``WHILE``.  Rather than a plain depth counter this tracks
+    *which* construct is innermost, because a bare ``THEN`` closes a ``WHILE``
+    while the same word closes an ``IF`` when the innermost construct is one.
+    Returns None when the BEGIN has no terminator at all.
+    """
+    stack = []
+    for j in range(start + 1, len(cells)):
+        c = cells[j]
+        v = c[1] if c[0] == "prim" else None
+        if c[0] == "ploop":
+            v = "+LOOP"
+        if v is None:
+            continue
+        if v in ("DO", "?DO", "BEGIN", "IF", "CASE", "OF", "WHILE"):
+            stack.append(v)
+            continue
+        if v in ("LOOP", "+LOOP", "AGAIN", "UNTIL", "REPEAT", "THEN"):
+            if not stack:
+                return j                      # closes the BEGIN itself
+            if stack[-1] == "WHILE" and len(stack) == 1 \
+                    and v in ("THEN", "REPEAT"):
+                return j                      # closes the loop's own WHILE
+            stack.pop()                       # closes a nested construct
+            continue
+        if v in ("ENDOF", "ENDCASE"):
+            if stack:
+                stack.pop()
     return None
+
+
+def _close_begin(f):
+    """Drop the bookkeeping of the innermost open BEGIN and return its index.
+
+    Used by every BEGIN terminator (``AGAIN``/``UNTIL``/``REPEAT``, the
+    ``THEN`` of a ``WHILE`` and ``LEAVE``) so that a finished loop never leaves
+    state behind for the caller to trip over.
+    """
+    if not f.begin_stack:
+        return None
+    bidx, wdepth = f.begin_stack.pop()
+    del f.while_stack[wdepth:]
+    if f.struct_stack and f.struct_stack[-1] == "begin":
+        f.struct_stack.pop()
+    return bidx
 
 
 def _exec_if(f, cells, i):
@@ -1598,16 +1787,21 @@ def _exec_if(f, cells, i):
     t = f.find_match(cells, i, ("THEN",))
     if t is None:
         raise ForthError("IF without matching THEN")
-    f.struct_stack.append("if")
     e = _find_else(f, cells, i, t)
     if flag != 0:
         # true path: run then-block up to ELSE (if any), skip else-block
         end = e if e is not None else t
-        f.exec_tokens(cells, i + 1, end)
+        jump = f.exec_tokens(cells, i + 1, end)
+        if jump > end:
+            return jump          # a LEAVE inside the block left the construct
     else:
         # false path: skip then-block, run else-block if present
         if e is not None:
-            f.exec_tokens(cells, e + 1, t)
+            jump = f.exec_tokens(cells, e + 1, t)
+            if jump > t:
+                return jump
+    # NOTE: the THEN cell is consumed here (execution resumes after it), so
+    # unlike earlier revisions this leaves no marker on the control stacks.
     return t + 1
 
 
@@ -1619,21 +1813,20 @@ def _exec_else(f, cells, i):
 
 
 def _exec_then(f, cells, i):
-    if not f.struct_stack:
-        raise RuntimeError("THEN without IF/BEGIN")
-    typ = f.struct_stack.pop()
-    if typ == "begin":
-        bidx = f.begin_stack.pop()
-        if f.while_stack:
-            flag = f.while_stack.pop()
-            if flag == 0:
-                return i + 1
-        return bidx
-    return i + 1
+    # _exec_if consumes the THEN of an IF, so a THEN that the interpreter
+    # actually executes closes the WHILE of a BEGIN loop -- unless no WHILE is
+    # open, in which case it is a leftover and is simply stepped over.
+    if not f.begin_stack or len(f.while_stack) <= f.begin_stack[-1][1]:
+        return i + 1
+    flag = f.while_stack[-1]
+    bidx = _close_begin(f)
+    if flag == 0:
+        return i + 1
+    return bidx
 
 
 def _exec_begin(f, cells, i):
-    f.begin_stack.append(i)
+    f.begin_stack.append([i, len(f.while_stack)])
     f.struct_stack.append("begin")
     return i + 1
 
@@ -1641,25 +1834,31 @@ def _exec_begin(f, cells, i):
 def _exec_while(f, cells, i):
     flag = f.ds.pop()
     f.while_stack.append(flag)
-    return i + 1
+    if flag != 0:
+        return i + 1
+    # A false flag ends the loop: jump just past its terminator and forget the
+    # loop, so the rest of the body (up to THEN/REPEAT) is not executed.
+    stack = _open_constructs(f, cells, i)
+    if not stack or stack[-1][0] != "BEGIN":
+        raise ForthError("WHILE without BEGIN")
+    t = _find_begin_end(f, cells, stack[-1][1])
+    if t is None:
+        raise ForthError("WHILE without matching THEN/REPEAT")
+    _close_begin(f)
+    return t + 1
 
 
 def _exec_again(f, cells, i):
     if not f.begin_stack:
-        raise RuntimeError("AGAIN without BEGIN")
-    bidx = f.begin_stack.pop()
-    if f.struct_stack and f.struct_stack[-1] == "begin":
-        f.struct_stack.pop()
-    return bidx
+        raise ForthError("AGAIN without BEGIN")
+    return _close_begin(f)
 
 
 def _exec_until(f, cells, i):
     flag = f.ds.pop()
     if not f.begin_stack:
-        raise RuntimeError("UNTIL without BEGIN")
-    bidx = f.begin_stack.pop()
-    if f.struct_stack and f.struct_stack[-1] == "begin":
-        f.struct_stack.pop()
+        raise ForthError("UNTIL without BEGIN")
+    bidx = _close_begin(f)
     if flag != 0:
         return i + 1
     return bidx
@@ -1667,15 +1866,8 @@ def _exec_until(f, cells, i):
 
 def _exec_repeat(f, cells, i):
     if not f.begin_stack:
-        raise RuntimeError("REPEAT without BEGIN")
-    bidx = f.begin_stack.pop()
-    if f.struct_stack and f.struct_stack[-1] == "begin":
-        f.struct_stack.pop()
-    if f.while_stack:
-        flag = f.while_stack.pop()
-        if flag == 0:
-            return i + 1
-    return bidx
+        raise ForthError("REPEAT without BEGIN")
+    return _close_begin(f)
 
 
 def _exec_do(f, cells, i):
@@ -1683,99 +1875,136 @@ def _exec_do(f, cells, i):
     nlim = f.ds.pop()
     n = f.ds.pop()
     L = f.find_match(cells, i, ("LOOP", "+LOOP"))
-    if L is None or L >= len(cells):
-        raise RuntimeError("DO without matching LOOP/+LOOP")
-    # Determine the step source from the terminator cell.  A dynamic (+LOOP
-    # without a compile-time constant) reads its step once from the data stack
-    # when the loop is entered; that value then persists for the whole loop.
+    if L is None:
+        raise ForthError("DO without matching LOOP/+LOOP")
     term = cells[L]
     if term[0] == "ploop":
+        dynamic = False
         step = term[1]            # constant step baked in at compile time
     elif term[1] == "+LOOP":
-        step = f.ds.pop()         # dynamic step, read a single time
-    else:                         # plain LOOP -> fixed step of +1
+        # A dynamic +LOOP takes its increment from the data stack at the end of
+        # every pass; 1 is only a placeholder for the first pass.
+        dynamic = True
         step = 1
-    f.loops.append([n, nlim, step])
-    # ?DO: skip the whole body when the start already equals the limit.
+    else:
+        dynamic = False
+        # Plain LOOP always runs towards the limit: up when the start is below
+        # it, down when the start is above it.  (PyForth's DO is
+        # "( start limit -- )", so "10 1 DO ... LOOP" counts 10, 9, ... 2
+        # instead of silently doing nothing.)
+        step = -1 if n > nlim else 1
     if qdo and n == nlim:
-        f.loops.pop()
+        if dynamic:
+            f.ds.pop()            # the loop's unused increment
         return L + 1
+    entry = [n, nlim, step, dynamic]
+    f.loops.append(entry)
     while True:
         cur = f.loops[-1]
         ivalue = cur[0]
-        # Normal termination test based on the sign of the step.
-        if step > 0 and ivalue >= nlim:
+        limit = cur[1]
+        stp = cur[2]
+        if stp > 0 and ivalue >= limit:
             f.loops.pop()
             return L + 1
-        if step < 0 and ivalue <= nlim:
+        if stp < 0 and ivalue <= limit:
             f.loops.pop()
             return L + 1
-        if step == 0 and ivalue == nlim:
+        if stp == 0 and ivalue == limit:
             f.loops.pop()
             return L + 1
         try:
-            f.exec_tokens(cells, i + 1, L)
+            jump = f.exec_tokens(cells, i + 1, L)
         except _LeaveSignal:
-            # LEAVE popped this loop's entry already; unwind to just past
-            # the terminator.
+            # LEAVE abandons the innermost construct, which is this loop.
+            f.loops.pop()
             return L + 1
-        if f.loops and f.loops[-1] is not cur:
-            continue   # inner loop left early (nested DO)
-        cur[0] = ivalue + step
+        if jump > L:
+            # A LEAVE from a BEGIN loop nested in the body jumped past this
+            # loop's terminator, so the body is finished: leave this loop too.
+            f.loops.pop()
+            return jump
+        if not f.loops or f.loops[-1] is not cur:
+            continue   # an inner loop left early; our own entry is intact
+        if cur[3]:
+            stp = f.ds.pop()
+            cur[2] = stp
+        cur[0] = ivalue + stp
 
 
 def _exec_loop(f, cells, i):
-    return _exec_do(f, cells, i)
+    # A LOOP cell is only reached when it is *not* the terminator of a DO
+    # (_exec_do consumes it), so the program is unbalanced.
+    raise ForthError("LOOP without DO")
 
 
 def _exec_plusloop(f, cells, i):
-    nlim = f.ds.pop()
-    n = f.ds.pop()
-    L = f.find_match(cells, i, ("LOOP", "+LOOP"))
-    f.loops.append([n, nlim])
-    while True:
-        cur = f.loops[-1]
-        try:
-            f.exec_tokens(cells, i + 1, L)
-        except _LeaveSignal:
-            return L + 1
-        if f.loops and f.loops[-1] is not cur:
-            continue
-        step = f.ds.pop()
-        cur[0] += step
-        nlim = cur[1]
-        if step > 0:
-            done = cur[0] >= nlim
-        elif step < 0:
-            done = cur[0] <= nlim
-        else:
-            done = False
-        if not f.loops:
-            break
-        if done:
-            f.loops.pop()
-            return L + 1
+    raise ForthError("+LOOP without DO")
 
 
 def _exec_leave(f, cells, i):
-    t = f.find_match(cells, i, ("LOOP", "+LOOP", "REPEAT", "UNTIL", "AGAIN", "ENDCASE"),
-                     require_depth=False)
+    stack = _open_constructs(f, cells, i)
+    if not stack:
+        raise ForthError("LEAVE outside a loop")
+    kind, start = stack[-1]
+    if kind in ("DO", "?DO"):
+        t = f.find_match(cells, start, ("LOOP", "+LOOP"))
+        if t is None:
+            raise ForthError("LEAVE without matching LOOP/+LOOP")
+        # Only the loop that owns the top of the loop stack is abandoned, so an
+        # enclosing loop keeps its I/J intact.
+        raise _LeaveSignal(t + 1)
+    t = _find_begin_end(f, cells, start)
     if t is None:
-        raise RuntimeError("LEAVE without loop/case")
-    if f.loops:
-        # Only a DO...LOOP is abandoned via the exception (it owns the top of
-        # the loop stack).  A BEGIN...loop is left by merely skipping past its
-        # terminator, which needs no stack cleanup.
-        term = cells[t]
-        if term[0] == "ploop" or term[1] in ("LOOP", "+LOOP"):
-            f.loops.pop()
-            raise _LeaveSignal(t + 1)
+        raise ForthError("LEAVE without matching terminator")
+    _close_begin(f)
     return t + 1
 
 
+def _drop_selector(f, sel_idx):
+    """Remove the CASE selector recorded at ``sel_idx``, if it is still there.
+
+    A branch body is free to consume stack items, which can take the recorded
+    position out of range; dropping is a no-op in that case.
+    """
+    if sel_idx is not None and 0 <= sel_idx < len(f.ds.data):
+        del f.ds.data[sel_idx]
+
+
+def _scan_case(f, cells, i):
+    """Locate the ``ENDOF`` and ``ENDCASE`` that belong to the OF at ``i``.
+
+    Returns ``(endof, endcase)``; either may be None.  Nesting of OF/ENDOF and
+    of whole CASE/ENDCASE constructs is tracked so that a branch belonging to
+    an inner OF (or an inner CASE) is never mistaken for this one.
+    """
+    depth = 0          # nested OF ... ENDOF pairs
+    cases = 0          # nested CASE ... ENDCASE pairs
+    endof = None
+    for j in range(i + 1, len(cells)):
+        c = cells[j]
+        if c[0] != "prim":
+            continue
+        v = c[1]
+        if v == "OF":
+            depth += 1
+        elif v == "ENDOF":
+            if depth == 0:
+                endof = j
+            else:
+                depth -= 1
+        elif v == "CASE":
+            cases += 1
+        elif v == "ENDCASE":
+            if cases == 0:
+                return endof, j
+            cases -= 1
+    return endof, None
+
+
 def _exec_case(f, cells, i):
-    # record where the CASE selector sits so the matching OF (or ENDCASE in
-    # the fall-through path) can remove exactly it, not whatever the selected
+    # Record where the CASE selector sits so the matching OF (or ENDCASE on the
+    # fall-through path) can remove exactly it -- not whatever the selected
     # branch happened to push above it.
     f.case_stack.append(len(f.ds.data) - 1)
     return i + 1
@@ -1783,32 +2012,34 @@ def _exec_case(f, cells, i):
 
 def _exec_of(f, cells, i):
     v = f.ds.pop()
-    endof = _find_first(f, cells, i, ("ENDOF",))
-    endcase = _find_first(f, cells, i, ("ENDCASE",))
-    ec = endcase if endcase is not None else len(cells)
+    endof, endcase = _scan_case(f, cells, i)
     sel_idx = f.case_stack[-1] if f.case_stack else None
-    matched = sel_idx is not None and f.ds.data[sel_idx] == v
+    usable = sel_idx is not None and 0 <= sel_idx < len(f.ds.data)
+    matched = usable and f.ds.data[sel_idx] == v
+    if matched:
+        # Run the branch (up to its ENDOF, or up to ENDCASE when the last
+        # branch has no ENDOF) and then leave the CASE construct entirely.
+        end = endof if endof is not None else (
+            endcase if endcase is not None else len(cells))
+        jump = f.exec_tokens(cells, i + 1, end)
+        _drop_selector(f, sel_idx)
+        f.case_stack.pop()
+        if jump > end:
+            return jump          # a LEAVE inside the branch left the CASE
+        if endcase is not None:
+            return endcase + 1
+        return i + 1
     if endof is not None:
-        if matched:
-            f.exec_tokens(cells, i + 1, endof)
-            f.ds.data.pop(sel_idx)
-            f.case_stack.pop()
-            return ec + 1
         return endof + 1
-    else:
-        # no ENDOF: body runs up to ENDCASE
-        if matched:
-            f.exec_tokens(cells, i + 1, ec)
-            f.ds.data.pop(sel_idx)
-            f.case_stack.pop()
-        return ec + 1
+    if endcase is not None:
+        return endcase + 1
+    raise ForthError("OF without matching ENDOF/ENDCASE")
 
 
 def _exec_endcase(f, cells, i):
     # Reached only when no OF matched; remove the leftover CASE selector.
     if f.case_stack:
-        idx = f.case_stack.pop()
-        del f.ds.data[idx]
+        _drop_selector(f, f.case_stack.pop())
     return i + 1
 
 
